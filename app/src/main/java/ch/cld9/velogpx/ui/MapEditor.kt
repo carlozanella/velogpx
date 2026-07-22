@@ -580,7 +580,7 @@ private class MapRenderer {
     private fun colorString(argb: Long) = String.format("#%06X", argb and 0xFFFFFF)
 }
 
-private class LassoOverlayView(context: Context) : View(context) {
+internal class LassoOverlayView(context: Context) : View(context) {
     private val density = resources.displayMetrics.density
     private val points = mutableListOf<PointF>()
     private val lassoPath = Path()

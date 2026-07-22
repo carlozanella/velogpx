@@ -851,7 +851,10 @@ private fun LayersPanel(
                     onClick = {
                         if (state.selectionMode) viewModel.toggleTrackSelection(track.id) else viewModel.selectTrack(track.id)
                     },
-                    onLongClick = { viewModel.enterSelectionMode(track.id) },
+                    onLongClick = {
+                        if (state.selectionMode) viewModel.toggleTrackSelection(track.id)
+                        else viewModel.enterSelectionMode(track.id)
+                    },
                     onLongClickLabel = "Start selecting tracks",
                 )
                     .background(if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f) else Color.Transparent),
