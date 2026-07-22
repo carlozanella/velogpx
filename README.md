@@ -6,23 +6,22 @@ VeloGPX is a local-first Android GPX editor built for assembling long bicycle to
 
 - Imports several GPX 1.0/1.1 files through Android's file picker, share sheet, or “Open with”.
 - Preserves tracks, track segments, routes, waypoints, metadata, timestamps, elevation, legacy course/speed, and namespace-aware extension XML.
-- Overlays every track in a color-coded layer list with selection, visibility, renaming, duplication, deletion, color, and ordering controls.
-- Draws straight segments offline or bicycle-routed segments through BRouter's public service with touring, road, gravel, low-traffic, and shortest profiles.
-- Selects, moves, deletes, splits, and trims track points directly from the map.
-- Reverses tracks with chronological timestamp repair; combines tracks while retaining gaps or explicitly stitches them continuously.
-- Auto-orders and orients imported sources to minimize endpoint gaps before merging.
+- Overlays every track in a color-coded layer list with exact map focus, direct line picking, persistent multi-selection, bulk show/hide/delete/share, and collapsible groups.
+- Provides an explicit BRouter planner for start, end, and via anchors; touring, road, gravel, low-traffic, and shortest profiles; up to four preview alternatives; and safe new/append/prepend application.
+- Selects, moves, deletes, trims, repeatedly splits, and extracts spans directly from the map with transactional previews.
+- Guides joining selected tracks through an optimized order/orientation preview, per-draft keep-gap/straight/routed connector policy, exact connector endpoints, and keep-or-replace source choice.
 - Removes duplicates and likely GPS spikes, simplifies geometry with protected semantic points, smooths/fills elevation, and generates/shifts/removes timestamps.
 - Splits a master route into exact, consecutively numbered daily stages by target distance.
 - Shows WGS84 distance, ascent/descent, time, speed, point counts, and an elevation profile.
-- Exports the whole project, only the selected track, or a ZIP containing one GPX per track/day.
-- Provides 75-step undo/redo, atomic internal autosave, crash recovery, and explicit GPX 1.0 or 1.1 export.
+- Exports the whole project, only the selected track, or a ZIP containing one GPX per track/day, and shares projects/tracks/segments to Garmin Connect through Android.
+- Stores multiple named projects as checksummed atomic `.velogpx` archives, restores the last project/camera/layers/groups/selection, autosaves every change, rotates recovery snapshots, and provides 75-step undo/redo.
 - Uses OpenFreeMap/MapLibre without an API key. GPX editing and export work without a backend.
 
 No account, analytics SDK, broad storage permission, location permission, or VeloGPX backend is used. Online map display and the optional public BRouter request require internet; file editing does not.
 
 ## Install
 
-Download `VeloGPX-1.0.0.apk` from the latest GitHub Release and allow installation from your browser/files app. The release APK is signed with a development key for direct personal installation.
+Download `VeloGPX-1.1.0.apk` from the latest GitHub Release and allow installation from your browser/files app. The release APK is signed with a development key for direct personal installation.
 
 Android 8.0 (API 26) or newer is supported. The app targets Android 17/API 37.
 
@@ -45,16 +44,18 @@ The release build intentionally uses the standard Android debug signing key for 
 ## Using the editor
 
 1. Tap the folder icon and import one or several GPX files.
-2. Use **Layers** to color, hide, order, duplicate, or select sources.
-3. On **Map**, use Select, Line, Route, Move, Split, or POI mode. Routed drawing sends only the selected anchors to BRouter.
-4. Open the wand button for transforms, merge choices, timestamp/elevation tools, or daily-stage planning.
-5. Inspect **Profile**, undo/redo as needed, then export from the overflow menu.
+2. Use **Layers** to focus a route, or tap **Select** for multi-track bulk actions, grouping, guided joining, or Garmin sharing.
+3. On **Map**, use Select, Line, Move, Split, or POI. Tap **Plan** for the dedicated route planner; it never chooses a hidden starting point.
+4. For joining, select two or more layers and preview order, reversed sources, gaps, connector policy, output name, and source retention before Apply.
+5. In Split mode, tap the rendered track, add one or several cut markers, then split once or extract the span between exactly two markers.
+6. Open the wand button for cleaning, timestamp/elevation tools, daily-stage planning, and other transforms.
+7. Inspect **Profile**, undo/redo as needed, then export or open **Garmin** from Layers.
 
 Important semantics:
 
-- Combining as segments preserves discontinuities and does not count gaps in distance.
-- Stitching creates explicit straight connecting edges.
-- Auto-order/orient reports the resulting connector-gap total and remains undoable.
+- Join previews do not modify the project; Apply creates one undoable edit. Keeping gaps does not count discontinuities as travelled distance.
+- Split/range and route-planner previews are also transactional and reject stale source geometry.
+- Append/prepend never invents a teleport edge: an unmatched route is retained as a separate GPX segment.
 - GPX 1.0 is retained by default after import; choose the desired version explicitly on export.
 - Source files are never overwritten. Export is always explicit.
 

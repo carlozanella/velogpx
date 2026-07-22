@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">VeloGPX</string>
+    <string name="share_gpx_chooser_title">Share GPX route</string>
 </resources>
-

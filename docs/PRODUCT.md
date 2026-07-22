@@ -1,6 +1,6 @@
 # Product research and scope
 
-Research was checked on 21 July 2026 against the live products and primary documentation.
+Research was checked on 21–22 July 2026 against the live products and primary documentation.
 
 ## Design target
 
@@ -15,20 +15,19 @@ The baseline reviewed was [gpx.studio](https://gpx.studio/help/toolbar): multi-f
 - Garmin BaseCamp's [track editing](https://www8.garmin.com/manuals/webhelp/basecamppc/EN-US/GUID-CAB01C01-DC90-419F-883F-5B862FA5DCFB.html).
 - EuroVelo's [GPX downloads](https://en.eurovelo.com/news/2022-07-25_you-can-now-download-eurovelo-routes-and-stages-as-gpx-tracks), including the warning that full routes may contain developing sections.
 
-## Implemented release requirements
+## Implemented v1.1 requirements
 
 1. Data-safe GPX 1.0/1.1 import/export with unknown extension preservation and explicit version choice.
-2. Multi-source layers, route/track/segment distinction, colored overlays, ordering, selection, and non-destructive autosave.
-3. Point selection/move/delete, exact split, both-sided trim, reverse, duplicate, and 75-step undo/redo.
-4. Gap-preserving combine versus explicit stitch, plus endpoint-based source auto-ordering/orientation.
-5. Bicycle route drawing with configurable BRouter profile and a straight-line offline fallback.
+2. Versioned multi-project archives with last-project restoration, presentation state, checksums, atomic autosave, corruption recovery, and snapshots.
+3. Multi-source layers with exact focus, rendered-line selection, overlap disambiguation, groups, persistent multi-select, and bulk operations.
+4. Transactional repeated split/span extraction and guided selected-track joining with optimized orientation, explicit gap policy, routed connectors, and safe source retention.
+5. A dedicated explicit BRouter planner with start/end/vias, five profiles, alternatives 0–3, metrics, cancellation/staleness safety, and new/append/prepend modes.
 6. Simplification, duplicate/spike removal, elevation smoothing/interpolation, and timestamp generation/shift/clear.
 7. WGS84 geodesic statistics, segment-gap-safe distance, elevation profile, and daily-stage generation.
-8. Android Storage Access Framework/share-intent integration, no broad storage permission, and crash recovery.
+8. Android Storage Access Framework/share-intent integration plus Garmin Connect project/track/segment sharing, without broad storage permission or a backend.
 
 ## Longer-term depth
 
 The architecture deliberately leaves clean provider boundaries for bundled BRouter `.rd5` regions, imported local PMTiles, DEM elevation lookup, OSM surface/access auditing, selected-span road matching, overlap removal, alternative comparison, stage optimization around overnight POIs, KML/TCX/FIT, and cue sheets. Those require substantial map datasets or additional format engines and are not disguised as backend-dependent features.
 
 No backend is justified for the editing core. Sync, collaboration, and public share links would be the first features that warrant one.
-

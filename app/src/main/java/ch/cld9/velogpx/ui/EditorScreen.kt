@@ -3,6 +3,7 @@
 package ch.cld9.velogpx.ui
 
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
@@ -50,12 +51,14 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.BottomAppBar
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -78,6 +81,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -86,15 +90,23 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import ch.cld9.velogpx.data.project.ProjectSaveStatus
+import ch.cld9.velogpx.engine.JoinGapStrategy
 import ch.cld9.velogpx.engine.ReverseTimePolicy
 import ch.cld9.velogpx.engine.TrackStatistics
 import ch.cld9.velogpx.model.GpxPoint
 import ch.cld9.velogpx.model.GpxVersion
 import ch.cld9.velogpx.routing.BicycleProfile
+import ch.cld9.velogpx.share.GpxShareRequest
+import ch.cld9.velogpx.share.GpxShareService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -111,9 +123,14 @@ fun EditorScreen(viewModel: EditorViewModel) {
     var timeDialog by remember { mutableStateOf(false) }
     var stagesDialog by remember { mutableStateOf(false) }
     var renameDialog by remember { mutableStateOf(false) }
-    var confirmNew by remember { mutableStateOf(false) }
+    var projectBrowser by remember { mutableStateOf(false) }
+    var confirmBulkDelete by remember { mutableStateOf(false) }
+    var groupDialog by remember { mutableStateOf(false) }
+    var shareDialog by remember { mutableStateOf(false) }
     var exportVersion by remember { mutableStateOf(GpxVersion.V1_1) }
     var exportSelectedOnly by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
     val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         viewModel.importUris(uris)
@@ -138,9 +155,9 @@ fun EditorScreen(viewModel: EditorViewModel) {
             TopAppBar(
                 title = {
                     Column {
-                        Text(state.document.metadata?.name ?: "VeloGPX", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(state.projectTitle, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(
-                            "${state.document.tracks.size} tracks · ${state.document.pointCount} points${if (state.dirty) " · autosaved" else ""}",
+                            "${state.document.tracks.size} tracks · ${state.document.pointCount} points · ${saveStatusLabel(state.saveStatus)}",
                             style = MaterialTheme.typography.labelSmall,
                         )
                     }
@@ -153,6 +170,15 @@ fun EditorScreen(viewModel: EditorViewModel) {
                     }
                     IconButton(onClick = { menuOpen = true }) { Icon(Icons.Default.MoreVert, "Project menu") }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Projects") },
+                            leadingIcon = { Icon(Icons.Default.Layers, null) },
+                            onClick = { menuOpen = false; projectBrowser = true },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Create recovery snapshot") },
+                            onClick = { menuOpen = false; viewModel.createSnapshot() },
+                        )
                         DropdownMenuItem(
                             text = { Text("Export GPX 1.1") },
                             leadingIcon = { Icon(Icons.Default.Save, null) },
@@ -185,7 +211,6 @@ fun EditorScreen(viewModel: EditorViewModel) {
                             enabled = state.document.tracks.isNotEmpty(),
                         )
                         DropdownMenuItem(text = { Text("Rename selected track") }, onClick = { menuOpen = false; renameDialog = true }, enabled = state.selectedTrack != null)
-                        DropdownMenuItem(text = { Text("New project") }, onClick = { menuOpen = false; confirmNew = true })
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)),
@@ -216,16 +241,22 @@ fun EditorScreen(viewModel: EditorViewModel) {
             when (state.panel) {
                 EditorPanel.MAP -> MapPanel(state, viewModel, onTools = { toolsOpen = true })
                 EditorPanel.PROFILE -> ProfilePanel(state, viewModel, onTools = { toolsOpen = true })
-                EditorPanel.LAYERS -> LayersPanel(state, viewModel)
+                EditorPanel.LAYERS -> LayersPanel(
+                    state,
+                    viewModel,
+                    onShare = { shareDialog = true },
+                    onDelete = { confirmBulkDelete = true },
+                    onGroup = { groupDialog = true },
+                )
             }
-            if (state.busy) {
+            if (state.busy || state.loadingProject) {
                 Surface(
                     modifier = Modifier.align(Alignment.TopCenter).padding(16.dp),
                     shape = RoundedCornerShape(24.dp), tonalElevation = 8.dp,
                 ) {
                     Row(Modifier.padding(horizontal = 18.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                         CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
-                        Spacer(Modifier.width(12.dp)); Text("Working…")
+                        Spacer(Modifier.width(12.dp)); Text(if (state.loadingProject) "Opening project…" else "Working…")
                     }
                 }
             }
@@ -247,9 +278,7 @@ fun EditorScreen(viewModel: EditorViewModel) {
         interpolate = { viewModel.interpolateElevation(); toolsOpen = false },
         time = { toolsOpen = false; timeDialog = true },
         stages = { toolsOpen = false; stagesDialog = true },
-        autoOrder = { viewModel.autoOrderAndOrientTracks(); toolsOpen = false },
-        mergeSegments = { viewModel.mergeAll(false); toolsOpen = false },
-        stitch = { viewModel.mergeAll(true); toolsOpen = false },
+        guidedJoin = { viewModel.prepareJoin(); toolsOpen = false },
     )
     if (simplifyDialog) SimplifyDialog(
         dismiss = { simplifyDialog = false },
@@ -269,66 +298,138 @@ fun EditorScreen(viewModel: EditorViewModel) {
         current = state.selectedTrack?.name.orEmpty(), dismiss = { renameDialog = false },
         apply = { viewModel.renameSelected(it); renameDialog = false },
     )
-    if (confirmNew) AlertDialog(
-        onDismissRequest = { confirmNew = false },
-        title = { Text("Start a new project?") },
-        text = { Text("The current project is autosaved, but starting over will clear that recovery copy. Export anything you want to keep first.") },
-        confirmButton = { Button(onClick = { viewModel.newProject(); confirmNew = false }) { Text("Start new") } },
-        dismissButton = { TextButton(onClick = { confirmNew = false }) { Text("Cancel") } },
+    if (projectBrowser) ProjectBrowserDialog(
+        state = state,
+        onDismiss = { projectBrowser = false },
+        onCreate = viewModel::newProject,
+        onOpen = { viewModel.openProject(it); projectBrowser = false },
+        onRenameCurrent = viewModel::renameProject,
+        onDuplicate = viewModel::duplicateProject,
+        onDelete = viewModel::deleteProject,
+        onSnapshot = viewModel::createSnapshot,
     )
+    if (confirmBulkDelete) AlertDialog(
+        onDismissRequest = { confirmBulkDelete = false },
+        title = { Text("Delete selected tracks?") },
+        text = { Text("${state.selectedTrackIds.size} track${if (state.selectedTrackIds.size == 1) "" else "s"} will be removed in one undoable edit.") },
+        confirmButton = { Button(onClick = { viewModel.deleteSelectedTracks(); confirmBulkDelete = false }) { Text("Delete") } },
+        dismissButton = { TextButton(onClick = { confirmBulkDelete = false }) { Text("Cancel") } },
+    )
+    if (groupDialog) GroupDialog(
+        dismiss = { groupDialog = false },
+        apply = { viewModel.createGroup(it); groupDialog = false },
+    )
+    if (shareDialog) ShareToGarminDialog(
+        state = state,
+        dismiss = { shareDialog = false },
+        share = { requests ->
+            shareDialog = false
+            scope.launch {
+                runCatching {
+                    val service = GpxShareService(context)
+                    val prepared = withContext(Dispatchers.IO) { service.prepare(requests) }
+                    context.startActivity(service.createShareIntent(prepared).intent)
+                }.onFailure { error ->
+                    Toast.makeText(context, "Could not share GPX: ${error.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        },
+    )
+    state.mapTrackChoice?.let { choice ->
+        AlertDialog(
+            onDismissRequest = viewModel::dismissMapTrackChoice,
+            title = { Text(if (choice.forSplit) "Which track should be split?" else "Select a track") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Text("Several tracks overlap here.")
+                    choice.trackIds.forEach { id ->
+                        val track = state.document.tracks.firstOrNull { it.id == id }
+                        TextButton(onClick = { viewModel.chooseMapTrack(id) }, modifier = Modifier.fillMaxWidth()) {
+                            Text(track?.name ?: "Unnamed track")
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = viewModel::dismissMapTrackChoice) { Text("Cancel") } },
+        )
+    }
 }
 
 @Composable
 private fun MapPanel(state: EditorUiState, viewModel: EditorViewModel, onTools: () -> Unit) {
+    val draftLines = remember(
+        state.document,
+        state.routePlanner.active,
+        state.routePlanner.candidates,
+        state.routePlanner.selectedAlternative,
+        state.splitDraft,
+        state.joinDraft,
+    ) { state.draftLines }
+    val draftAnchors = remember(state.routePlanner.anchors, state.splitDraft) { state.draftAnchors }
     Box(Modifier.fillMaxSize()) {
         MapEditor(
             document = state.document,
             styles = state.styles,
-            selectedTrackId = state.selectedTrackId,
+            selectedTrackIds = state.selectedTrackIds.ifEmpty { setOfNotNull(state.selectedTrackId) },
             selectedPoint = state.selectedPoint,
-            onMapTap = viewModel::onMapTap,
+            onMapTap = when {
+                state.routePlanner.active -> viewModel::onRoutePlannerTap
+                state.editMode == EditMode.SPLIT -> { _, _ -> viewModel.onSplitEmptyMapTap() }
+                else -> viewModel::onMapTap
+            },
+            onTracksTap = viewModel::onMapTracksTap,
+            trackPickingEnabled = !state.routePlanner.active && state.editMode in setOf(EditMode.SELECT, EditMode.SPLIT),
+            focusRequest = state.focusRequest,
+            initialCamera = state.camera,
+            onCameraIdle = viewModel::onCameraIdle,
+            draftLines = draftLines,
+            draftAnchors = draftAnchors,
             modifier = Modifier.fillMaxSize(),
         )
-        ModeBar(
-            selected = state.editMode,
-            onSelected = viewModel::setMode,
-            modifier = Modifier.align(Alignment.TopCenter).padding(top = 10.dp),
-        )
-        Column(Modifier.align(Alignment.BottomEnd).padding(16.dp), horizontalAlignment = Alignment.End) {
-            state.selectedStatistics?.let { stats ->
-                Surface(shape = RoundedCornerShape(16.dp), tonalElevation = 6.dp) {
-                    Text("${formatDistance(stats.distanceMeters)} · ${stats.pointCount} pts", Modifier.padding(horizontal = 12.dp, vertical = 8.dp), style = MaterialTheme.typography.labelLarge)
-                }
-                Spacer(Modifier.height(8.dp))
-            }
-            FloatingActionButton(onClick = onTools) { Icon(Icons.Default.AutoFixHigh, "Editing tools") }
-        }
-        if (state.editMode == EditMode.DRAW_ROUTED) {
-            Surface(
-                modifier = Modifier.align(Alignment.TopCenter).padding(top = 86.dp),
-                shape = RoundedCornerShape(20.dp), tonalElevation = 6.dp,
-            ) {
-                LazyRow(Modifier.padding(horizontal = 8.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    items(BicycleProfile.entries) { profile ->
-                        AssistChip(
-                            onClick = { viewModel.setProfile(profile) },
-                            label = { Text(profile.label) },
-                            leadingIcon = if (state.bicycleProfile == profile) ({ Icon(Icons.AutoMirrored.Filled.AltRoute, null, Modifier.size(16.dp)) }) else null,
-                        )
+        if (state.routePlanner.active) {
+            RoutePlannerControls(state, viewModel, Modifier.align(Alignment.TopCenter).padding(10.dp))
+        } else {
+            if (state.joinDraft == null && state.splitDraft == null) {
+                ModeBar(
+                    selected = state.editMode,
+                    onSelected = viewModel::setMode,
+                    onPlanRoute = viewModel::openRoutePlanner,
+                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 10.dp),
+                )
+                Column(Modifier.align(Alignment.BottomEnd).padding(16.dp), horizontalAlignment = Alignment.End) {
+                    state.selectedStatistics?.let { stats ->
+                        Surface(shape = RoundedCornerShape(16.dp), tonalElevation = 6.dp) {
+                            Text("${formatDistance(stats.distanceMeters)} · ${stats.pointCount} pts", Modifier.padding(horizontal = 12.dp, vertical = 8.dp), style = MaterialTheme.typography.labelLarge)
+                        }
+                        Spacer(Modifier.height(8.dp))
                     }
+                    FloatingActionButton(onClick = onTools) { Icon(Icons.Default.AutoFixHigh, "Editing tools") }
                 }
             }
+        }
+        state.splitDraft?.let { draft ->
+            SplitPreviewCard(draft.cuts.size, viewModel, Modifier.align(Alignment.BottomStart).padding(16.dp))
+        }
+        state.joinDraft?.let { draft ->
+            JoinPreviewCard(
+                draft,
+                state.document.tracks.associate { it.id to (it.name ?: "Unnamed") },
+                state.busy,
+                viewModel,
+                Modifier.align(Alignment.BottomStart).padding(16.dp),
+            )
         }
     }
 }
 
 @Composable
-private fun ModeBar(selected: EditMode, onSelected: (EditMode) -> Unit, modifier: Modifier = Modifier) {
+private fun ModeBar(selected: EditMode, onSelected: (EditMode) -> Unit, onPlanRoute: () -> Unit, modifier: Modifier = Modifier) {
     Surface(modifier, shape = RoundedCornerShape(24.dp), tonalElevation = 8.dp) {
         LazyRow(Modifier.padding(5.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
             item { ModeButton("Select", Icons.Default.Straighten, selected == EditMode.SELECT) { onSelected(EditMode.SELECT) } }
             item { ModeButton("Line", Icons.Default.Polyline, selected == EditMode.DRAW_STRAIGHT) { onSelected(EditMode.DRAW_STRAIGHT) } }
-            item { ModeButton("Route", Icons.AutoMirrored.Filled.AltRoute, selected == EditMode.DRAW_ROUTED) { onSelected(EditMode.DRAW_ROUTED) } }
+            item { ModeButton("Plan", Icons.AutoMirrored.Filled.AltRoute, false, onPlanRoute) }
             item { ModeButton("Move", Icons.Default.EditLocationAlt, selected == EditMode.MOVE) { onSelected(EditMode.MOVE) } }
             item { ModeButton("Split", Icons.Default.ContentCopy, selected == EditMode.SPLIT) { onSelected(EditMode.SPLIT) } }
             item { ModeButton("POI", Icons.Default.AddLocationAlt, selected == EditMode.WAYPOINT) { onSelected(EditMode.WAYPOINT) } }
@@ -350,26 +451,201 @@ private fun ModeButton(label: String, icon: ImageVector, selected: Boolean, onCl
 }
 
 @Composable
-private fun LayersPanel(state: EditorUiState, viewModel: EditorViewModel) {
+private fun RoutePlannerControls(state: EditorUiState, viewModel: EditorViewModel, modifier: Modifier = Modifier) {
+    val draft = state.routePlanner
+    Surface(modifier.fillMaxWidth().padding(horizontal = 6.dp), shape = RoundedCornerShape(22.dp), tonalElevation = 10.dp) {
+        Column(Modifier.padding(14.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Route planner", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        when (draft.anchors.size) {
+                            0 -> "Tap the map to choose a start"
+                            1 -> "Start set · tap an end"
+                            else -> "${draft.anchors.size - 2} via point${if (draft.anchors.size == 3) "" else "s"} · new taps add vias before the end"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                TextButton(onClick = viewModel::closeRoutePlanner) { Text("Cancel") }
+            }
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                items(BicycleProfile.entries) { profile ->
+                    FilterChip(
+                        selected = state.bicycleProfile == profile,
+                        onClick = { viewModel.setProfile(profile) },
+                        label = { Text(profile.label) },
+                    )
+                }
+                if (state.selectedTrack != null && draft.anchors.isEmpty()) {
+                    item { AssistChip(onClick = viewModel::useSelectedEndpointAsRouteStart, label = { Text("Use track end") }) }
+                }
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = viewModel::removeLastRouteAnchor, enabled = draft.anchors.isNotEmpty(), modifier = Modifier.weight(1f)) { Text("Undo point") }
+                OutlinedButton(onClick = viewModel::reverseRouteAnchors, enabled = draft.anchors.size >= 2, modifier = Modifier.weight(1f)) { Text("Reverse") }
+                Button(onClick = viewModel::calculateRoutes, enabled = draft.anchors.size >= 2 && !draft.busy, modifier = Modifier.weight(1f)) {
+                    if (draft.busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Text("Route")
+                }
+            }
+            draft.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            if (draft.candidates.isNotEmpty()) {
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(draft.candidates, key = { it.alternative.name }) { candidate ->
+                        val metrics = candidate.path.metrics
+                        FilterChip(
+                            selected = candidate.alternative == draft.selectedAlternative,
+                            onClick = { viewModel.selectRouteCandidate(candidate.alternative) },
+                            label = {
+                                Text(buildString {
+                                    append(candidate.alternative.label)
+                                    metrics.distanceMeters?.let { append(" · ${formatDistance(it)}") }
+                                    metrics.filteredAscentMeters?.let { append(" · ${it.roundToInt()} m ↑") }
+                                })
+                            },
+                        )
+                    }
+                }
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    item { FilterChip(selected = draft.applyMode == RouteApplyMode.NEW_TRACK, onClick = { viewModel.setRouteApplyMode(RouteApplyMode.NEW_TRACK) }, label = { Text("New track") }) }
+                    if (state.selectedTrack != null) {
+                        item { FilterChip(selected = draft.applyMode == RouteApplyMode.APPEND_TO_SELECTED, onClick = { viewModel.setRouteApplyMode(RouteApplyMode.APPEND_TO_SELECTED) }, label = { Text("Append") }) }
+                        item { FilterChip(selected = draft.applyMode == RouteApplyMode.PREPEND_TO_SELECTED, onClick = { viewModel.setRouteApplyMode(RouteApplyMode.PREPEND_TO_SELECTED) }, label = { Text("Prepend") }) }
+                    }
+                    item {
+                        Button(onClick = viewModel::applyPlannedRoute, enabled = draft.selectedAlternative != null) { Text("Apply") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SplitPreviewCard(cutCount: Int, viewModel: EditorViewModel, modifier: Modifier = Modifier) {
+    Surface(modifier, shape = RoundedCornerShape(20.dp), tonalElevation = 10.dp) {
+        Column(Modifier.padding(14.dp)) {
+            Text("Split preview · $cutCount cut${if (cutCount == 1) "" else "s"}", style = MaterialTheme.typography.titleMedium)
+            Text("Tap the map to add cuts. Nothing changes until Apply.", style = MaterialTheme.typography.bodySmall)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                TextButton(onClick = viewModel::clearSplitDraft) { Text("Cancel") }
+                OutlinedButton(onClick = viewModel::undoLastSplitCut) { Text("Undo cut") }
+                if (cutCount == 2) OutlinedButton(onClick = viewModel::extractSplitSpan) { Text("Extract span") }
+                Button(onClick = viewModel::applySplitDraft) { Text("Apply") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun JoinPreviewCard(
+    draft: JoinDraft,
+    trackNames: Map<String, String>,
+    busy: Boolean,
+    viewModel: EditorViewModel,
+    modifier: Modifier = Modifier,
+) {
+    Surface(modifier.fillMaxWidth(0.86f), shape = RoundedCornerShape(20.dp), tonalElevation = 10.dp) {
+        Column(Modifier.padding(14.dp)) {
+            Text("Join preview · ${draft.plan.order.size} tracks", style = MaterialTheme.typography.titleMedium)
+            Text("Endpoint gaps ${formatDistance(draft.plan.totalGapMeters)} · ${draft.plan.order.count { it.reversed }} reversed", style = MaterialTheme.typography.bodySmall)
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                items(draft.plan.order) { ref ->
+                    val name = draft.plan.order.indexOf(ref) + 1
+                    AssistChip(onClick = {}, label = { Text("$name. ${if (ref.reversed) "↶ " else ""}${trackNames[ref.trackId]}") })
+                }
+            }
+            OutlinedTextField(
+                value = draft.name,
+                onValueChange = viewModel::setJoinName,
+                label = { Text("Output track name") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                item { FilterChip(selected = draft.plan.edges.all { it.strategy == JoinGapStrategy.PRESERVE_SEGMENT_GAP }, onClick = { viewModel.setJoinStrategy(JoinGapStrategy.PRESERVE_SEGMENT_GAP) }, label = { Text("Keep gaps") }, enabled = !busy) }
+                item { FilterChip(selected = draft.plan.edges.all { it.strategy == JoinGapStrategy.STRAIGHT_CONNECTOR }, onClick = { viewModel.setJoinStrategy(JoinGapStrategy.STRAIGHT_CONNECTOR) }, label = { Text("Straight") }, enabled = !busy) }
+                item { FilterChip(selected = draft.plan.edges.all { it.strategy == JoinGapStrategy.ROUTED_CONNECTOR }, onClick = { viewModel.setJoinStrategy(JoinGapStrategy.ROUTED_CONNECTOR) }, label = { Text("Route gaps") }, enabled = !busy) }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = viewModel::cancelJoin) { Text("Cancel") }
+                OutlinedButton(onClick = { viewModel.setJoinKeepOriginals(!draft.keepOriginals) }, enabled = !busy) {
+                    Text(if (draft.keepOriginals) "Keep sources ✓" else "Replace sources")
+                }
+                Button(onClick = viewModel::applyJoin, enabled = !busy) { Text(if (busy) "Routing…" else "Apply") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LayersPanel(
+    state: EditorUiState,
+    viewModel: EditorViewModel,
+    onShare: () -> Unit,
+    onDelete: () -> Unit,
+    onGroup: () -> Unit,
+) {
     if (state.document.tracks.isEmpty() && state.document.routes.isEmpty() && state.document.waypoints.isEmpty()) {
         EmptyProject(Modifier.fillMaxSize())
         return
     }
+    val collapsedTrackIds = state.groups.filter { it.collapsed }.flatMapTo(mutableSetOf()) { it.layerIds }
     LazyColumn(Modifier.fillMaxSize()) {
         item {
-            Text("Tracks", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(20.dp, 18.dp, 20.dp, 6.dp))
+            Row(Modifier.fillMaxWidth().padding(20.dp, 12.dp, 12.dp, 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("Tracks", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                TextButton(onClick = { if (state.selectionMode) viewModel.exitSelectionMode() else viewModel.enterSelectionMode() }) {
+                    Text(if (state.selectionMode) "Done" else "Select")
+                }
+                if (state.selectionMode) TextButton(onClick = viewModel::selectAllTracks) { Text("All") }
+            }
         }
-        items(state.document.tracks, key = { it.id }) { track ->
-            val selected = track.id == state.selectedTrackId
+        if (state.selectionMode) {
+            item {
+                Surface(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp), shape = RoundedCornerShape(18.dp), tonalElevation = 3.dp) {
+                    Column(Modifier.padding(10.dp)) {
+                        Text("${state.selectedTrackIds.size} selected", style = MaterialTheme.typography.titleMedium)
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedButton(onClick = viewModel::focusSelectedTracks, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Show on map") }
+                            OutlinedButton(onClick = { viewModel.setSelectedTracksVisible(true) }, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Show") }
+                            OutlinedButton(onClick = { viewModel.setSelectedTracksVisible(false) }, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Hide") }
+                            OutlinedButton(onClick = onGroup, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Group") }
+                            OutlinedButton(onClick = { viewModel.prepareJoin() }, enabled = state.selectedTrackIds.size >= 2) { Text("Join") }
+                            OutlinedButton(onClick = onShare, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Garmin") }
+                            OutlinedButton(onClick = onDelete, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Delete") }
+                        }
+                    }
+                }
+            }
+        }
+        if (state.groups.isNotEmpty()) {
+            item { Text("Groups", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) }
+            items(state.groups, key = { it.id }) { group ->
+                ListItem(
+                    headlineContent = { Text(group.name) },
+                    supportingContent = { Text("${group.layerIds.size} track${if (group.layerIds.size == 1) "" else "s"}") },
+                    leadingContent = { Text(if (group.collapsed) "▸" else "▾") },
+                    trailingContent = { IconButton(onClick = { viewModel.deleteGroup(group.id) }) { Icon(Icons.Default.Delete, "Delete group") } },
+                    modifier = Modifier.clickable { viewModel.toggleGroupCollapsed(group.id) },
+                )
+            }
+            item { HorizontalDivider() }
+        }
+        items(state.document.tracks.filterNot { it.id in collapsedTrackIds }, key = { it.id }) { track ->
+            val selected = track.id in state.selectedTrackIds || (!state.selectionMode && track.id == state.selectedTrackId)
             val style = state.styles[track.id]
+            val group = state.groups.firstOrNull { track.id in it.layerIds }
             ListItem(
                 headlineContent = { Text(track.name ?: "Unnamed track", fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal) },
                 supportingContent = {
                     val stats = ch.cld9.velogpx.engine.GpxAnalytics.statistics(track)
-                    Text("${track.segments.size} segment${if (track.segments.size == 1) "" else "s"} · ${formatDistance(stats.distanceMeters)} · ${stats.pointCount} points")
+                    Text("${track.segments.size} segment${if (track.segments.size == 1) "" else "s"} · ${formatDistance(stats.distanceMeters)} · ${stats.pointCount} points${group?.let { " · ${it.name}" }.orEmpty()}")
                 },
                 leadingContent = {
-                    Box(Modifier.size(18.dp).background(Color(style?.color ?: 0xFF176B45), CircleShape))
+                    if (state.selectionMode) {
+                        Checkbox(checked = selected, onCheckedChange = { viewModel.toggleTrackSelection(track.id) })
+                    } else Box(Modifier.size(18.dp).background(Color(style?.color ?: 0xFF176B45), CircleShape))
                 },
                 trailingContent = {
                     Row {
@@ -378,10 +654,12 @@ private fun LayersPanel(state: EditorUiState, viewModel: EditorViewModel) {
                         }
                     }
                 },
-                modifier = Modifier.clickable { viewModel.selectTrack(track.id) }
+                modifier = Modifier.clickable {
+                    if (state.selectionMode) viewModel.toggleTrackSelection(track.id) else viewModel.selectTrack(track.id)
+                }
                     .background(if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f) else Color.Transparent),
             )
-            if (selected) {
+            if (selected && !state.selectionMode) {
                 FlowRow(
                     Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -389,6 +667,7 @@ private fun LayersPanel(state: EditorUiState, viewModel: EditorViewModel) {
                     OutlinedButton(onClick = viewModel::duplicateSelectedTrack) { Text("Duplicate") }
                     OutlinedButton(onClick = { viewModel.moveSelectedTrack(-1) }) { Text("Move up") }
                     OutlinedButton(onClick = { viewModel.moveSelectedTrack(1) }) { Text("Move down") }
+                    OutlinedButton(onClick = onShare) { Text("Garmin") }
                     OutlinedButton(onClick = viewModel::deleteSelectedTrack) { Icon(Icons.Default.Delete, null); Text("Delete") }
                 }
                 Row(
@@ -566,9 +845,7 @@ private fun TransformSheet(
     interpolate: () -> Unit,
     time: () -> Unit,
     stages: () -> Unit,
-    autoOrder: () -> Unit,
-    mergeSegments: () -> Unit,
-    stitch: () -> Unit,
+    guidedJoin: () -> Unit,
 ) {
     ModalBottomSheet(onDismissRequest = dismiss) {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp).padding(bottom = 24.dp)) {
@@ -588,11 +865,9 @@ private fun TransformSheet(
             ToolRow("Fill missing elevation", "Distance-weighted interpolation between known samples", interpolate, state.selectedTrack != null)
             ToolRow("Time tools", "Generate, shift, or clear timestamps", time, state.selectedTrack != null)
             ToolRow("Plan daily stages", "Split into complete day tracks by target distance", stages, state.selectedTrack != null)
-            if (state.document.tracks.size > 1) {
+            if (state.selectedTrackIds.size > 1) {
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
-                ToolRow("Auto-order and orient", "Greedily minimize endpoint gaps, then review", autoOrder, true)
-                ToolRow("Combine as segments", "Preserve gaps between every source", mergeSegments, true)
-                ToolRow("Stitch continuously", "Create explicit connecting edges", stitch, true)
+                ToolRow("Join selected tracks", "Preview order, orientation, every gap, and whether sources are retained", guidedJoin, true)
             }
         }
     }
@@ -660,6 +935,61 @@ private fun RenameDialog(current: String, dismiss: () -> Unit, apply: (String) -
 }
 
 @Composable
+private fun GroupDialog(dismiss: () -> Unit, apply: (String) -> Unit) {
+    var name by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = dismiss,
+        title = { Text("Group selected tracks") },
+        text = { OutlinedTextField(name, { name = it }, label = { Text("Group name") }, singleLine = true) },
+        confirmButton = { Button(onClick = { apply(name) }, enabled = name.isNotBlank()) { Text("Create group") } },
+        dismissButton = { TextButton(onClick = dismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun ShareToGarminDialog(
+    state: EditorUiState,
+    dismiss: () -> Unit,
+    share: (List<GpxShareRequest>) -> Unit,
+) {
+    val ids = state.selectedTrackIds.ifEmpty { setOfNotNull(state.selectedTrackId) }
+    val tracks = state.document.tracks.filter { it.id in ids }
+    AlertDialog(
+        onDismissRequest = dismiss,
+        title = { Text("Send to Garmin Connect") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text("Android will open Garmin Connect when it accepts GPX sharing, otherwise you can choose it from the system share sheet.")
+                Spacer(Modifier.height(12.dp))
+                OutlinedButton(
+                    onClick = { share(listOf(GpxShareRequest.Document(state.document))) },
+                    enabled = !state.document.isEmpty,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Send whole project") }
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = { share(tracks.map { GpxShareRequest.Track(state.document, it.id) }) },
+                    enabled = tracks.isNotEmpty(),
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text(if (tracks.size > 1) "Send ${tracks.size} selected tracks" else "Send track") }
+                if (tracks.size == 1 && tracks.single().segments.size > 1) {
+                    Spacer(Modifier.height(12.dp))
+                    Text("Or send one segment", style = MaterialTheme.typography.titleSmall)
+                    tracks.single().segments.forEachIndexed { index, segment ->
+                        TextButton(
+                            onClick = { share(listOf(GpxShareRequest.Segment(state.document, tracks.single().id, segment.id))) },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("Segment ${index + 1} · ${segment.points.size} points") }
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = dismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
 private fun StageDialog(dismiss: () -> Unit, apply: (Double) -> Unit) {
     var kilometers by remember { mutableStateOf("80") }
     AlertDialog(
@@ -682,10 +1012,17 @@ private fun StageDialog(dismiss: () -> Unit, apply: (Double) -> Unit) {
 }
 
 private fun exportName(state: EditorUiState, extension: String): String {
-    val base = (state.document.metadata?.name ?: "bicycle-route")
+    val base = state.projectTitle
         .replace(Regex("[^A-Za-z0-9._-]+"), "-").trim('-').ifBlank { "bicycle-route" }
     return "$base.$extension"
 }
 
 private fun formatDistance(meters: Double): String = if (meters < 1000) "${meters.roundToInt()} m" else "%.1f km".format(meters / 1000)
 private fun formatDuration(duration: java.time.Duration): String = "%d:%02d".format(duration.toHours(), duration.toMinutes() % 60)
+private fun saveStatusLabel(status: ProjectSaveStatus?): String = when (status) {
+    is ProjectSaveStatus.Saved -> "saved"
+    is ProjectSaveStatus.Pending -> "autosave pending"
+    is ProjectSaveStatus.Saving -> "saving"
+    is ProjectSaveStatus.Error -> "save failed"
+    null -> "opening"
+}

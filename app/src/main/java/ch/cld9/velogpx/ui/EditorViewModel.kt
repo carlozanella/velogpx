@@ -4,12 +4,27 @@ import android.app.Application
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import ch.cld9.velogpx.data.ProjectStore
+import ch.cld9.velogpx.VeloGpxApplication
+import ch.cld9.velogpx.data.project.ProjectAutosaveSession
+import ch.cld9.velogpx.data.project.ProjectCamera
+import ch.cld9.velogpx.data.project.ProjectEditorState
+import ch.cld9.velogpx.data.project.ProjectLayerGroup
+import ch.cld9.velogpx.data.project.ProjectOpenResult
+import ch.cld9.velogpx.data.project.ProjectRecoverySource
+import ch.cld9.velogpx.data.project.ProjectSaveStatus
+import ch.cld9.velogpx.data.project.ProjectSelection
+import ch.cld9.velogpx.data.project.ProjectState
+import ch.cld9.velogpx.data.project.ProjectSummary
 import ch.cld9.velogpx.engine.GeoMath
 import ch.cld9.velogpx.engine.GpxAnalytics
 import ch.cld9.velogpx.engine.GpxOperations
+import ch.cld9.velogpx.engine.JoinGapStrategy
+import ch.cld9.velogpx.engine.JoinPlan
+import ch.cld9.velogpx.engine.JoinPlanner
 import ch.cld9.velogpx.engine.ReverseTimePolicy
 import ch.cld9.velogpx.engine.StagePlanner
+import ch.cld9.velogpx.engine.TrackLocation
+import ch.cld9.velogpx.engine.TrackRangeEngine
 import ch.cld9.velogpx.engine.TrackStatistics
 import ch.cld9.velogpx.io.GpxParser
 import ch.cld9.velogpx.io.GpxWriter
@@ -22,14 +37,20 @@ import ch.cld9.velogpx.model.GpxVersion
 import ch.cld9.velogpx.model.TrackStyle
 import ch.cld9.velogpx.routing.BRouterClient
 import ch.cld9.velogpx.routing.BicycleProfile
+import ch.cld9.velogpx.routing.RouteAlternative
+import ch.cld9.velogpx.routing.RouteCoordinate
+import ch.cld9.velogpx.routing.RoutedPath
+import ch.cld9.velogpx.routing.RoutingAnchor
+import ch.cld9.velogpx.routing.RoutingOutcome
+import ch.cld9.velogpx.routing.RoutingRequest
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.time.Duration
 import java.time.Instant
@@ -38,8 +59,41 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
-enum class EditMode { SELECT, DRAW_STRAIGHT, DRAW_ROUTED, MOVE, SPLIT, WAYPOINT }
+enum class EditMode { SELECT, DRAW_STRAIGHT, MOVE, SPLIT, WAYPOINT }
 enum class EditorPanel { MAP, PROFILE, LAYERS }
+
+enum class RouteApplyMode { NEW_TRACK, APPEND_TO_SELECTED, PREPEND_TO_SELECTED }
+
+data class RouteCandidate(val alternative: RouteAlternative, val path: RoutedPath)
+
+data class RoutePlannerDraft(
+    val active: Boolean = false,
+    val anchors: List<RoutingAnchor> = emptyList(),
+    val candidates: List<RouteCandidate> = emptyList(),
+    val selectedAlternative: RouteAlternative? = null,
+    val applyMode: RouteApplyMode = RouteApplyMode.NEW_TRACK,
+    val targetTrackId: String? = null,
+    val sourceDocumentRevision: Long = 0,
+    val requestToken: String? = null,
+    val busy: Boolean = false,
+    val error: String? = null,
+)
+
+data class SplitDraft(val trackId: String, val cuts: List<TrackLocation>, val sourceDocumentRevision: Long)
+
+data class JoinDraft(
+    val plan: JoinPlan,
+    val keepOriginals: Boolean = true,
+    val name: String = "Joined route",
+    val sourceDocumentRevision: Long,
+)
+
+data class MapTrackChoice(
+    val trackIds: List<String>,
+    val latitude: Double,
+    val longitude: Double,
+    val forSplit: Boolean,
+)
 
 data class PointSelection(
     val trackId: String,
@@ -51,6 +105,8 @@ data class EditorUiState(
     val document: GpxDocument = GpxDocument(metadata = GpxMetadata(name = "Untitled bicycle tour")),
     val styles: Map<String, TrackStyle> = emptyMap(),
     val selectedTrackId: String? = null,
+    val selectedTrackIds: Set<String> = emptySet(),
+    val selectionMode: Boolean = false,
     val selectedPoint: PointSelection? = null,
     val editMode: EditMode = EditMode.SELECT,
     val panel: EditorPanel = EditorPanel.MAP,
@@ -61,43 +117,245 @@ data class EditorUiState(
     val dirty: Boolean = false,
     val message: String? = null,
     val recoveredAutosave: Boolean = false,
+    val loadingProject: Boolean = true,
+    val projectId: String? = null,
+    val projectTitle: String = "Untitled bicycle tour",
+    val projects: List<ProjectSummary> = emptyList(),
+    val saveStatus: ProjectSaveStatus? = null,
+    val groups: List<ProjectLayerGroup> = emptyList(),
+    val camera: MapCameraState? = null,
+    val focusRequest: MapFocusRequest? = null,
+    val splitDraft: SplitDraft? = null,
+    val joinDraft: JoinDraft? = null,
+    val routePlanner: RoutePlannerDraft = RoutePlannerDraft(),
+    val mapTrackChoice: MapTrackChoice? = null,
 ) {
     val selectedTrack: GpxTrack? get() = document.tracks.firstOrNull { it.id == selectedTrackId }
     val selectedStatistics: TrackStatistics? get() = selectedTrack?.let(GpxAnalytics::statistics)
+
+    val draftAnchors: List<GpxPoint>
+        get() = when {
+            routePlanner.active -> routePlanner.anchors.map { it.coordinate.toGpxPoint() }
+            splitDraft != null -> splitDraft.cuts.map(TrackLocation::projectedPoint)
+            else -> emptyList()
+        }
+
+    val draftLines: List<MapDraftLine>
+        get() {
+            if (routePlanner.active) return routePlanner.candidates.map { candidate ->
+                MapDraftLine(
+                    points = candidate.path.points.map { it.toGpxPoint() },
+                    color = if (candidate.alternative == routePlanner.selectedAlternative) 0xFF7B1FA2 else 0xFF607D8B,
+                    selected = candidate.alternative == routePlanner.selectedAlternative,
+                )
+            }
+            splitDraft?.let { draft ->
+                val track = document.tracks.firstOrNull { it.id == draft.trackId } ?: return emptyList()
+                val parts = runCatching { TrackRangeEngine.splitAtLocations(track, draft.cuts).tracks }.getOrNull()
+                    ?: return emptyList()
+                val colors = listOf(0xFF7B1FA2, 0xFF00838F, 0xFFD84315, 0xFF1565C0)
+                return parts.flatMapIndexed { index, part ->
+                    part.segments.map { segment -> MapDraftLine(segment.points, colors[index % colors.size], selected = true) }
+                }
+            }
+            val draft = joinDraft ?: return emptyList()
+            val tracks = document.tracks.associateBy(GpxTrack::id)
+            return buildList {
+                draft.plan.order.forEachIndexed { index, reference ->
+                    val track = tracks[reference.trackId] ?: return@forEachIndexed
+                    track.segments.forEach { segment ->
+                        add(MapDraftLine(segment.points, color = 0xFF7B1FA2, selected = true))
+                    }
+                    val edge = draft.plan.edges.getOrNull(index) ?: return@forEachIndexed
+                    when (edge.strategy) {
+                        JoinGapStrategy.PRESERVE_SEGMENT_GAP -> Unit
+                        JoinGapStrategy.STRAIGHT_CONNECTOR -> {
+                            val fromPoints = track.segments.flatMap { it.points }
+                            val nextTrack = draft.plan.order.getOrNull(index + 1)?.let { tracks[it.trackId] }
+                            val toPoints = nextTrack?.segments?.flatMap { it.points }.orEmpty()
+                            val from = if (reference.reversed) fromPoints.firstOrNull() else fromPoints.lastOrNull()
+                            val nextReversed = draft.plan.order.getOrNull(index + 1)?.reversed == true
+                            val to = if (nextReversed) toPoints.lastOrNull() else toPoints.firstOrNull()
+                            if (from != null && to != null) add(MapDraftLine(listOf(from, to), 0xFF7B1FA2, true))
+                        }
+                        JoinGapStrategy.ROUTED_CONNECTOR -> edge.routedConnector?.let { connector ->
+                            add(MapDraftLine(connector.points, color = 0xFF7B1FA2, selected = true))
+                        }
+                    }
+                }
+            }
+        }
 }
 
 class EditorViewModel(application: Application) : AndroidViewModel(application) {
-    private val store = ProjectStore(application)
+    private val repository = (application as VeloGpxApplication).projectRepository
     private val router = BRouterClient()
     private val undo = ArrayDeque<GpxDocument>()
     private val redo = ArrayDeque<GpxDocument>()
     private val parser = GpxParser()
     private val writer = GpxWriter()
-    private val autosaveMutex = Mutex()
-    private val autosaveGeneration = AtomicLong()
-
-    private val initialDocument = runCatching { store.loadAutosave() }.getOrNull()
-    private val _state = MutableStateFlow(
-        EditorUiState(
-            document = initialDocument ?: GpxDocument(metadata = GpxMetadata(name = "Untitled bicycle tour")),
-            styles = stylesFor(initialDocument?.tracks.orEmpty()),
-            selectedTrackId = initialDocument?.tracks?.firstOrNull()?.id,
-            recoveredAutosave = initialDocument != null,
-        ),
-    )
+    private val focusGeneration = AtomicLong()
+    private var project: ProjectState? = null
+    private var autosave: ProjectAutosaveSession? = null
+    private var saveStatusJob: Job? = null
+    private var routeJob: Job? = null
+    private var joinJob: Job? = null
+    private val pendingImports = mutableListOf<Uri>()
+    private val _state = MutableStateFlow(EditorUiState())
     val state: StateFlow<EditorUiState> = _state.asStateFlow()
 
-    fun consumeMessage() = _state.update { it.copy(message = null, recoveredAutosave = false) }
-    fun setMode(mode: EditMode) = _state.update { it.copy(editMode = mode, message = null) }
-    fun setPanel(panel: EditorPanel) = _state.update { it.copy(panel = panel) }
-    fun setProfile(profile: BicycleProfile) = _state.update { it.copy(bicycleProfile = profile) }
+    init {
+        viewModelScope.launch {
+            runCatching { repository.openLastOrCreate() }
+                .onSuccess { loadProject(it) }
+                .onFailure { error ->
+                    _state.update { it.copy(loadingProject = false, message = "Could not open projects: ${error.message}") }
+                }
+        }
+    }
 
-    fun selectTrack(id: String) = _state.update {
-        it.copy(selectedTrackId = id, selectedPoint = null, panel = EditorPanel.MAP)
+    fun consumeMessage() = _state.update { it.copy(message = null, recoveredAutosave = false) }
+
+    fun setMode(mode: EditMode) {
+        _state.update {
+            it.copy(
+                editMode = mode,
+                message = null,
+                splitDraft = if (mode == EditMode.SPLIT) it.splitDraft else null,
+            )
+        }
+    }
+
+    fun setPanel(panel: EditorPanel) {
+        _state.update { it.copy(panel = panel) }
+        persistEditorState()
+    }
+
+    fun setProfile(profile: BicycleProfile) {
+        if (_state.value.routePlanner.active && _state.value.bicycleProfile != profile) {
+            routeJob?.cancel()
+            _state.update {
+                it.copy(
+                    bicycleProfile = profile,
+                    routePlanner = it.routePlanner.copy(
+                        candidates = emptyList(), selectedAlternative = null, busy = false,
+                        requestToken = null, error = null,
+                    ),
+                )
+            }
+        } else _state.update { it.copy(bicycleProfile = profile) }
+        persistEditorState()
+    }
+
+    /** Layer-list selection deliberately focuses; map selection deliberately does not. */
+    fun selectTrack(id: String) = selectTrack(id, focus = true)
+
+    fun selectTracksFromMap(ids: List<String>) {
+        val id = ids.firstOrNull { candidate -> _state.value.document.tracks.any { it.id == candidate } } ?: return
+        if (_state.value.selectionMode) toggleTrackSelection(id, focus = false) else selectTrack(id, focus = false)
+    }
+
+    fun onMapTracksTap(ids: List<String>, latitude: Double, longitude: Double) {
+        val valid = ids.filter { id -> _state.value.document.tracks.any { it.id == id } }.distinct()
+        if (valid.isEmpty()) return
+        if (valid.size > 1) {
+            _state.update {
+                it.copy(mapTrackChoice = MapTrackChoice(valid, latitude, longitude, it.editMode == EditMode.SPLIT))
+            }
+        } else if (_state.value.editMode == EditMode.SPLIT) {
+            addSplitCutOnTrack(valid, latitude, longitude)
+        } else selectTracksFromMap(valid)
+    }
+
+    fun chooseMapTrack(trackId: String) {
+        val choice = _state.value.mapTrackChoice ?: return
+        _state.update { it.copy(mapTrackChoice = null) }
+        if (choice.forSplit) addSplitCutOnTrack(listOf(trackId), choice.latitude, choice.longitude)
+        else selectTracksFromMap(listOf(trackId))
+    }
+
+    fun dismissMapTrackChoice() = _state.update { it.copy(mapTrackChoice = null) }
+
+    private fun selectTrack(id: String, focus: Boolean) {
+        val track = _state.value.document.tracks.firstOrNull { it.id == id } ?: return
+        _state.update { state ->
+            val selectedIds = if (state.selectionMode) state.selectedTrackIds + id else setOf(id)
+            state.copy(
+                selectedTrackId = id,
+                selectedTrackIds = selectedIds,
+                selectedPoint = null,
+                panel = EditorPanel.MAP,
+                styles = if (focus) state.styles + (id to (state.styles[id] ?: defaultStyle(state.styles.size)).copy(visible = true)) else state.styles,
+                focusRequest = if (focus) MapFocusRequest(focusGeneration.incrementAndGet(), track.segments.flatMap { it.points }) else state.focusRequest,
+            )
+        }
+        persistEditorState()
+    }
+
+    fun enterSelectionMode(initialTrackId: String? = _state.value.selectedTrackId) {
+        _state.update { state ->
+            val valid = initialTrackId?.takeIf { id -> state.document.tracks.any { it.id == id } }
+            state.copy(selectionMode = true, selectedTrackIds = valid?.let(::setOf) ?: emptySet(), selectedTrackId = valid)
+        }
+    }
+
+    fun exitSelectionMode() {
+        _state.update { state ->
+            val primary = state.selectedTrackId?.takeIf { it in state.selectedTrackIds }
+                ?: state.selectedTrackIds.firstOrNull()
+            state.copy(selectionMode = false, selectedTrackIds = setOfNotNull(primary), selectedTrackId = primary)
+        }
+        persistEditorState()
+    }
+
+    fun toggleTrackSelection(id: String, focus: Boolean = false) {
+        val track = _state.value.document.tracks.firstOrNull { it.id == id } ?: return
+        _state.update { state ->
+            val selected = state.selectedTrackIds.toMutableSet().apply {
+                if (!add(id)) remove(id)
+            }
+            val primary = if (id in selected) id else state.selectedTrackId?.takeIf(selected::contains) ?: selected.firstOrNull()
+            state.copy(
+                selectionMode = true,
+                selectedTrackIds = selected,
+                selectedTrackId = primary,
+                selectedPoint = null,
+                focusRequest = if (focus && id in selected) MapFocusRequest(focusGeneration.incrementAndGet(), track.segments.flatMap { it.points }) else state.focusRequest,
+            )
+        }
+        persistEditorState()
+    }
+
+    fun selectAllTracks() {
+        _state.update { state ->
+            val ids = state.document.tracks.mapTo(linkedSetOf(), GpxTrack::id)
+            state.copy(selectionMode = true, selectedTrackIds = ids, selectedTrackId = state.selectedTrackId ?: ids.firstOrNull())
+        }
+        persistEditorState()
+    }
+
+    fun focusSelectedTracks() {
+        val ids = _state.value.selectedTrackIds.ifEmpty { setOfNotNull(_state.value.selectedTrackId) }
+        val points = _state.value.document.tracks.filter { it.id in ids }.flatMap { it.segments }.flatMap { it.points }
+        if (points.isEmpty()) return
+        _state.update { it.copy(panel = EditorPanel.MAP, focusRequest = MapFocusRequest(focusGeneration.incrementAndGet(), points)) }
+        persistEditorState()
+    }
+
+    fun onCameraIdle(camera: MapCameraState) {
+        val previous = _state.value.camera
+        if (previous == camera) return
+        _state.update { it.copy(camera = camera) }
+        persistEditorState()
     }
 
     fun importUris(uris: List<Uri>) {
         if (uris.isEmpty()) return
+        if (_state.value.loadingProject) {
+            pendingImports += uris
+            _state.update { it.copy(message = "GPX import queued until the project finishes opening.") }
+            return
+        }
         _state.update { it.copy(busy = true, message = "Importing ${uris.size} file${if (uris.size == 1) "" else "s"}…") }
         viewModelScope.launch {
             val results = runCatching {
@@ -164,6 +422,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                     }
                 }
             }.onSuccess {
+                if (clearsDirty && _state.value.document == document) markProjectExported()
                 _state.update {
                     it.copy(
                         busy = false,
@@ -211,15 +470,63 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun newProject() {
-        undo.clear(); redo.clear()
-        val generation = autosaveGeneration.incrementAndGet()
-        viewModelScope.launch(Dispatchers.IO) {
-            autosaveMutex.withLock {
-                if (generation == autosaveGeneration.get()) store.clear()
-            }
+    fun newProject(title: String = "Untitled bicycle tour") {
+        viewModelScope.launch {
+            runCatching { repository.create(title.trim().ifBlank { "Untitled bicycle tour" }) }
+                .onSuccess { loadProject(ProjectOpenResult(it, ProjectRecoverySource.NEW_PROJECT)) }
+                .onFailure { error -> _state.update { it.copy(message = "Could not create project: ${error.message}") } }
         }
-        _state.value = EditorUiState(document = GpxDocument(metadata = GpxMetadata(name = "Untitled bicycle tour")))
+    }
+
+    fun openProject(projectId: String) {
+        if (projectId == _state.value.projectId) return
+        viewModelScope.launch {
+            _state.update { it.copy(loadingProject = true) }
+            runCatching { repository.open(projectId) }
+                .onSuccess { loadProject(it) }
+                .onFailure { error -> _state.update { it.copy(loadingProject = false, message = "Could not open project: ${error.message}") } }
+        }
+    }
+
+    fun renameProject(title: String) {
+        val projectId = _state.value.projectId ?: return
+        viewModelScope.launch {
+            runCatching { autosave?.flush(); repository.rename(projectId, title) }
+                .onSuccess { renamed -> loadProject(ProjectOpenResult(renamed)); refreshProjects() }
+                .onFailure { error -> _state.update { it.copy(message = "Could not rename project: ${error.message}") } }
+        }
+    }
+
+    fun duplicateProject(projectId: String) {
+        viewModelScope.launch {
+            runCatching {
+                if (projectId == _state.value.projectId) autosave?.flush()
+                repository.duplicate(projectId)
+            }
+                .onSuccess { duplicated -> loadProject(ProjectOpenResult(duplicated)); refreshProjects() }
+                .onFailure { error -> _state.update { it.copy(message = "Could not duplicate project: ${error.message}") } }
+        }
+    }
+
+    fun deleteProject(projectId: String) {
+        viewModelScope.launch {
+            runCatching {
+                if (projectId == _state.value.projectId) autosave?.close()
+                repository.moveToTrash(projectId)
+                if (projectId == _state.value.projectId) repository.openLastOrCreate() else null
+            }.onSuccess { replacement ->
+                if (replacement != null) loadProject(replacement) else refreshProjects()
+            }.onFailure { error -> _state.update { it.copy(message = "Could not move project to trash: ${error.message}") } }
+        }
+    }
+
+    fun createSnapshot() {
+        val projectId = _state.value.projectId ?: return
+        viewModelScope.launch {
+            runCatching { autosave?.flush(); repository.createSnapshot(projectId) }
+                .onSuccess { _state.update { it.copy(message = "Recovery snapshot created.") } }
+                .onFailure { error -> _state.update { it.copy(message = "Snapshot failed: ${error.message}") } }
+        }
     }
 
     fun undo() {
@@ -237,16 +544,15 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun onMapTap(latitude: Double, longitude: Double) {
         val point = GpxPoint(latitude, longitude)
         when (_state.value.editMode) {
-            EditMode.DRAW_STRAIGHT -> appendPoint(point, routed = false)
-            EditMode.DRAW_ROUTED -> appendPoint(point, routed = true)
+            EditMode.DRAW_STRAIGHT -> appendPoint(point)
             EditMode.WAYPOINT -> addWaypoint(point)
             EditMode.MOVE -> moveSelectedPoint(point)
-            EditMode.SPLIT -> splitAtMapPoint(point)
+            EditMode.SPLIT -> addSplitCut(point)
             EditMode.SELECT -> selectNearestPoint(point)
         }
     }
 
-    private fun appendPoint(point: GpxPoint, routed: Boolean) {
+    private fun appendPoint(point: GpxPoint) {
         val state = _state.value
         var track = state.selectedTrack
         if (track == null) {
@@ -257,27 +563,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         val segments = if (track.segments.isEmpty()) listOf(GpxTrackSegment()) else track.segments
         val lastSegment = segments.last()
         val lastPoint = lastSegment.points.lastOrNull()
-        if (!routed || lastPoint == null) {
-            replaceTrack(track.copy(segments = segments.dropLast(1) + lastSegment.copy(points = lastSegment.points + point)), "Point added.")
-            return
-        }
-        _state.update { it.copy(busy = true, message = "Routing ${state.bicycleProfile.label.lowercase()} segment…") }
-        viewModelScope.launch {
-            runCatching { router.route(listOf(lastPoint, point), state.bicycleProfile) }
-                .onSuccess { routedPoints ->
-                    if (_state.value.document.tracks.firstOrNull { it.id == track.id } != track) {
-                        _state.update { it.copy(busy = false, message = "The track changed while routing; the stale result was discarded. Tap again to retry.") }
-                        return@onSuccess
-                    }
-                    val addition = routedPoints.dropWhile { GeoMath.distanceMeters(it, lastPoint) < 0.2 }
-                    val updated = track.copy(segments = segments.dropLast(1) + lastSegment.copy(points = lastSegment.points + addition))
-                    replaceTrack(updated, "Bicycle segment added (${addition.size} points).")
-                    _state.update { it.copy(busy = false) }
-                }
-                .onFailure { error ->
-                    _state.update { it.copy(busy = false, message = "Routing failed: ${error.message}. Tap straight-line mode to continue offline.") }
-                }
-        }
+        replaceTrack(track.copy(segments = segments.dropLast(1) + lastSegment.copy(points = lastSegment.points + point)), "Point added.")
     }
 
     private fun addWaypoint(point: GpxPoint) {
@@ -330,35 +616,94 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private fun splitAtMapPoint(query: GpxPoint) {
+    private fun addSplitCut(query: GpxPoint) {
         val candidates = _state.value.selectedTrack?.let(::listOf) ?: _state.value.document.tracks
-        var best: Triple<GpxTrack, Int, GeoMath.Projection>? = null
-        candidates.forEach { track ->
-            track.segments.forEachIndexed { segmentIndex, segment ->
-                segment.points.zipWithNext().forEach { (start, end) ->
-                    val projection = GeoMath.projectToSegment(query, start, end)
-                    if (best == null || projection.distanceMeters < best!!.third.distanceMeters) {
-                        best = Triple(track, segmentIndex, projection)
-                    }
-                }
-            }
-        }
-        val match = best
-        if (match == null || match.third.distanceMeters > 500.0) {
+        val best = candidates.mapNotNull { track ->
+            runCatching { track to TrackRangeEngine.project(track, query) }.getOrNull()
+        }.minByOrNull { it.second.distanceFromQueryMeters }
+        if (best == null || best.second.distanceFromQueryMeters > 500.0) {
             _state.update { it.copy(message = "No track line is within 500 m. Zoom in and tap closer to the route.") }
             return
         }
-        val result = runCatching { GpxOperations.splitTrackAtProjectedPoint(match.first, match.second, query) }
+        val revision = project?.documentRevision ?: 0L
+        val existing = _state.value.splitDraft
+        val cuts = if (existing?.trackId == best.first.id && existing.sourceDocumentRevision == revision) existing.cuts + best.second else listOf(best.second)
+        _state.update {
+            it.copy(
+                selectedTrackId = best.first.id,
+                selectedTrackIds = setOf(best.first.id),
+                splitDraft = SplitDraft(best.first.id, cuts, revision),
+                message = "Cut ${cuts.size} positioned. Add more cuts or apply the split.",
+            )
+        }
+    }
+
+    fun addSplitCutOnTrack(trackIds: List<String>, latitude: Double, longitude: Double) {
+        val id = trackIds.firstOrNull { candidate -> _state.value.document.tracks.any { it.id == candidate } } ?: return
+        _state.update { it.copy(selectedTrackId = id, selectedTrackIds = setOf(id)) }
+        addSplitCut(GpxPoint(latitude, longitude))
+    }
+
+    fun onSplitEmptyMapTap() {
+        _state.update { it.copy(message = "Tap directly on the track you want to split. Zoom in if tracks overlap.") }
+    }
+
+    fun clearSplitDraft() = _state.update { it.copy(splitDraft = null, editMode = EditMode.SELECT) }
+
+    fun undoLastSplitCut() {
+        _state.update { state ->
+            val draft = state.splitDraft ?: return@update state
+            val remaining = draft.cuts.dropLast(1)
+            state.copy(splitDraft = if (remaining.isEmpty()) null else draft.copy(cuts = remaining))
+        }
+    }
+
+    fun applySplitDraft() {
+        val draft = _state.value.splitDraft ?: return
+        if (draft.sourceDocumentRevision != project?.documentRevision) {
+            _state.update { it.copy(splitDraft = null, message = "The track changed after the split preview. Place the cuts again.") }
+            return
+        }
+        val track = _state.value.document.tracks.firstOrNull { it.id == draft.trackId } ?: return
+        val result = runCatching { TrackRangeEngine.splitAtLocations(track, draft.cuts) }.getOrElse { error ->
+            _state.update { it.copy(message = error.message ?: "The requested cuts could not be applied.") }
+            return
+        }
+        val index = _state.value.document.tracks.indexOfFirst { it.id == track.id }
+        val tracks = _state.value.document.tracks.toMutableList().apply {
+            removeAt(index)
+            addAll(index, result.tracks)
+        }
+        commit(
+            _state.value.document.copy(tracks = tracks),
+            selectedTrackId = result.tracks.firstOrNull()?.id,
+            message = "Split into ${result.tracks.size} tracks in one undoable edit.",
+        )
+        _state.update { it.copy(splitDraft = null, editMode = EditMode.SELECT) }
+    }
+
+    fun extractSplitSpan() {
+        val draft = _state.value.splitDraft ?: return
+        if (draft.sourceDocumentRevision != project?.documentRevision) {
+            _state.update { it.copy(splitDraft = null, message = "The track changed after the span preview. Place the markers again.") }
+            return
+        }
+        if (draft.cuts.size != 2) {
+            _state.update { it.copy(message = "Place exactly two cut markers to extract a span.") }
+            return
+        }
+        val track = _state.value.document.tracks.firstOrNull { it.id == draft.trackId } ?: return
+        val result = runCatching { TrackRangeEngine.extractSpan(track, draft.cuts[0], draft.cuts[1], reverseWhenBackwards = true) }
             .getOrElse { error ->
-                _state.update { it.copy(message = error.message ?: "This endpoint cannot be split.") }
+                _state.update { it.copy(message = error.message ?: "The selected span could not be extracted.") }
                 return
             }
-        val tracks = _state.value.document.tracks.toMutableList()
-        val index = tracks.indexOfFirst { it.id == match.first.id }
-        tracks.removeAt(index)
-        tracks.addAll(index, listOf(result.first, result.second))
-        commit(_state.value.document.copy(tracks = tracks), selectedTrackId = result.second.id, message = "Track split at the projected map position.")
-        _state.update { it.copy(editMode = EditMode.SELECT) }
+        commit(
+            _state.value.document.copy(tracks = _state.value.document.tracks + result.track),
+            selectedTrackId = result.track.id,
+            message = result.warnings.firstOrNull() ?: "Extracted the selected span as a new track.",
+        )
+        _state.update { it.copy(splitDraft = null, editMode = EditMode.SELECT) }
     }
 
     private fun moveSelectedPoint(point: GpxPoint) {
@@ -547,6 +892,52 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         commit(_state.value.document.copy(tracks = tracks), selectedTrackId = tracks.firstOrNull()?.id, message = "Track deleted.")
     }
 
+    fun deleteSelectedTracks() {
+        val ids = _state.value.selectedTrackIds.ifEmpty { setOfNotNull(_state.value.selectedTrackId) }
+        if (ids.isEmpty()) return
+        val tracks = _state.value.document.tracks.filterNot { it.id in ids }
+        commit(
+            _state.value.document.copy(tracks = tracks),
+            selectedTrackId = tracks.firstOrNull()?.id,
+            message = "Deleted ${ids.size} track${if (ids.size == 1) "" else "s"}.",
+        )
+        _state.update { it.copy(selectionMode = false, selectedTrackIds = setOfNotNull(it.selectedTrackId)) }
+    }
+
+    fun setSelectedTracksVisible(visible: Boolean) {
+        val ids = _state.value.selectedTrackIds.ifEmpty { setOfNotNull(_state.value.selectedTrackId) }
+        _state.update { state ->
+            state.copy(styles = state.styles + ids.associateWith { id ->
+                (state.styles[id] ?: defaultStyle(state.styles.size)).copy(visible = visible)
+            })
+        }
+        persistEditorState()
+    }
+
+    fun createGroup(name: String) {
+        val ids = _state.value.selectedTrackIds.ifEmpty { setOfNotNull(_state.value.selectedTrackId) }
+        if (ids.isEmpty() || name.isBlank()) return
+        val group = ProjectLayerGroup(name = name.trim(), layerIds = ids.toList())
+        _state.update { state ->
+            state.copy(groups = state.groups.map { it.copy(layerIds = it.layerIds.filterNot(ids::contains)) } + group)
+        }
+        persistEditorState()
+    }
+
+    fun deleteGroup(groupId: String) {
+        _state.update { it.copy(groups = it.groups.filterNot { group -> group.id == groupId }) }
+        persistEditorState()
+    }
+
+    fun toggleGroupCollapsed(groupId: String) {
+        _state.update { state ->
+            state.copy(groups = state.groups.map { group ->
+                if (group.id == groupId) group.copy(collapsed = !group.collapsed) else group
+            })
+        }
+        persistEditorState()
+    }
+
     fun duplicateSelectedTrack() {
         val track = _state.value.selectedTrack ?: return
         val duplicate = track.copy(
@@ -557,11 +948,352 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         commit(_state.value.document.copy(tracks = _state.value.document.tracks + duplicate), selectedTrackId = duplicate.id, message = "Track duplicated.")
     }
 
+    fun prepareJoin(strategy: JoinGapStrategy = JoinGapStrategy.PRESERVE_SEGMENT_GAP) {
+        val ids = _state.value.selectedTrackIds.ifEmpty { setOfNotNull(_state.value.selectedTrackId) }
+        if (ids.size < 2) {
+            _state.update { it.copy(message = "Select at least two tracks to join.") }
+            return
+        }
+        val plan = runCatching { JoinPlanner.plan(_state.value.document.tracks, ids, strategy) }.getOrElse { error ->
+            _state.update { it.copy(message = "Join planning failed: ${error.message}") }
+            return
+        }
+        _state.update {
+            it.copy(
+                panel = EditorPanel.MAP,
+                joinDraft = JoinDraft(
+                    plan,
+                    name = "${it.selectedTrack?.name ?: "Route"} — joined",
+                    sourceDocumentRevision = project?.documentRevision ?: 0L,
+                ),
+                message = "Review the proposed order, directions, and endpoint gaps before applying.",
+            )
+        }
+    }
+
+    fun setJoinStrategy(strategy: JoinGapStrategy) {
+        if (_state.value.busy) return
+        val draft = _state.value.joinDraft ?: return
+        _state.update { it.copy(joinDraft = draft.copy(plan = draft.plan.copy(edges = draft.plan.edges.map { edge ->
+            edge.copy(strategy = strategy, routedConnector = edge.routedConnector.takeIf { strategy == JoinGapStrategy.ROUTED_CONNECTOR })
+        }))) }
+        if (strategy == JoinGapStrategy.ROUTED_CONNECTOR) routeJoinConnectors()
+    }
+
+    fun setJoinKeepOriginals(keep: Boolean) {
+        if (_state.value.busy) return
+        _state.update { it.copy(joinDraft = it.joinDraft?.copy(keepOriginals = keep)) }
+    }
+
+    fun setJoinName(name: String) {
+        _state.update { it.copy(joinDraft = it.joinDraft?.copy(name = name)) }
+    }
+
+    fun cancelJoin() {
+        joinJob?.cancel()
+        _state.update { it.copy(joinDraft = null, busy = false) }
+    }
+
+    private fun routeJoinConnectors() {
+        val original = _state.value.joinDraft ?: return
+        if (original.sourceDocumentRevision != project?.documentRevision) {
+            _state.update { it.copy(joinDraft = null, message = "The source tracks changed. Reopen the join preview.") }
+            return
+        }
+        val tracks = _state.value.document.tracks.associateBy(GpxTrack::id)
+        val profile = _state.value.bicycleProfile
+        joinJob?.cancel()
+        _state.update { it.copy(busy = true, message = "Routing ${original.plan.edges.size} connector${if (original.plan.edges.size == 1) "" else "s"}…") }
+        joinJob = viewModelScope.launch {
+            var plan = original.plan
+            var failures = 0
+            original.plan.edges.forEachIndexed { index, edge ->
+                val fromTrack = tracks[edge.from.trackId]
+                val toTrack = tracks[edge.to.trackId]
+                val from = fromTrack?.endpoint(edge.from.reversed, atStart = false)
+                val to = toTrack?.endpoint(edge.to.reversed, atStart = true)
+                if (from == null || to == null) {
+                    failures++
+                    plan = plan.withGapStrategy(index, JoinGapStrategy.PRESERVE_SEGMENT_GAP)
+                    return@forEachIndexed
+                }
+                when (val outcome = router.route(
+                    RoutingRequest(
+                        anchors = listOf(
+                            RoutingAnchor(RouteCoordinate.from(from)),
+                            RoutingAnchor(RouteCoordinate.from(to)),
+                        ),
+                        profile = profile,
+                    ),
+                )) {
+                    is RoutingOutcome.Success -> {
+                        val routed = outcome.path.points.map { it.toGpxPoint() }.toMutableList()
+                        val exactFrom = from.copy(id = UUID.randomUUID().toString())
+                        if (routed.firstOrNull()?.let { GeoMath.distanceMeters(from, it) > 0.001 } != false) routed.add(0, exactFrom)
+                        else routed[0] = exactFrom
+                        val exactTo = to.copy(id = UUID.randomUUID().toString())
+                        if (routed.lastOrNull()?.let { GeoMath.distanceMeters(to, it) > 0.001 } != false) routed += exactTo
+                        else routed[routed.lastIndex] = exactTo
+                        plan = plan.withRoutedConnector(index, GpxTrackSegment(points = routed))
+                    }
+                    is RoutingOutcome.Failure -> {
+                        failures++
+                        plan = plan.withGapStrategy(index, JoinGapStrategy.PRESERVE_SEGMENT_GAP)
+                    }
+                }
+            }
+            if (_state.value.joinDraft?.plan != original.plan || project?.documentRevision != original.sourceDocumentRevision ||
+                _state.value.bicycleProfile != profile
+            ) {
+                _state.update { it.copy(busy = false, message = "The join draft changed; routed connectors were discarded.") }
+            } else {
+                _state.update {
+                    val current = it.joinDraft ?: return@update it.copy(busy = false)
+                    it.copy(
+                        busy = false,
+                        joinDraft = current.copy(plan = plan),
+                        message = if (failures == 0) "All join gaps routed." else "$failures connector${if (failures == 1) "" else "s"} could not be routed; choose another gap policy.",
+                    )
+                }
+            }
+        }
+    }
+
+    fun applyJoin() {
+        val draft = _state.value.joinDraft ?: return
+        if (_state.value.busy) return
+        if (draft.sourceDocumentRevision != project?.documentRevision) {
+            _state.update { it.copy(joinDraft = null, message = "The source tracks changed. Reopen the join preview.") }
+            return
+        }
+        val joined = runCatching {
+            JoinPlanner.assemble(draft.plan, _state.value.document.tracks, draft.name.trim().ifBlank { "Joined route" })
+        }.getOrElse { error ->
+            _state.update { it.copy(message = "Could not assemble joined track: ${error.message}") }
+            return
+        }
+        val joinedIds = draft.plan.order.mapTo(linkedSetOf()) { it.trackId }
+        val old = _state.value.document.tracks
+        val insertion = old.indexOfFirst { it.id in joinedIds }.coerceAtLeast(0)
+        val tracks = if (draft.keepOriginals) {
+            old.toMutableList().apply { add((insertion + joinedIds.size).coerceAtMost(size), joined) }
+        } else {
+            old.filterNot { it.id in joinedIds }.toMutableList().apply { add(insertion.coerceAtMost(size), joined) }
+        }
+        commit(
+            _state.value.document.copy(tracks = tracks),
+            selectedTrackId = joined.id,
+            message = "Joined ${joinedIds.size} tracks${if (draft.keepOriginals) " and kept the sources" else ""}.",
+        )
+        _state.update { it.copy(joinDraft = null, selectionMode = false, selectedTrackIds = setOf(joined.id)) }
+    }
+
+    fun openRoutePlanner() {
+        _state.update {
+            it.copy(
+                panel = EditorPanel.MAP,
+                routePlanner = RoutePlannerDraft(
+                    active = true,
+                    sourceDocumentRevision = project?.documentRevision ?: 0L,
+                ),
+                message = "Tap a start, then an end point. No endpoint is preselected.",
+            )
+        }
+    }
+
+    fun useSelectedEndpointAsRouteStart() {
+        val point = _state.value.selectedTrack?.segments?.lastOrNull()?.points?.lastOrNull() ?: return
+        _state.update { state ->
+            state.copy(routePlanner = state.routePlanner.copy(
+                anchors = listOf(RoutingAnchor(RouteCoordinate.from(point))),
+                candidates = emptyList(),
+                selectedAlternative = null,
+                applyMode = RouteApplyMode.APPEND_TO_SELECTED,
+                targetTrackId = state.selectedTrackId,
+                sourceDocumentRevision = project?.documentRevision ?: 0L,
+            ))
+        }
+    }
+
+    fun closeRoutePlanner() {
+        routeJob?.cancel()
+        _state.update { it.copy(routePlanner = RoutePlannerDraft()) }
+    }
+
+    fun onRoutePlannerTap(latitude: Double, longitude: Double) {
+        routeJob?.cancel()
+        val anchor = RoutingAnchor(RouteCoordinate(latitude, longitude))
+        _state.update { state ->
+            val draft = state.routePlanner
+            val anchors = if (draft.anchors.size < 2) draft.anchors + anchor else draft.anchors.dropLast(1) + anchor + draft.anchors.last()
+            state.copy(routePlanner = draft.copy(
+                anchors = anchors, candidates = emptyList(), selectedAlternative = null,
+                busy = false, requestToken = null, error = null,
+            ))
+        }
+    }
+
+    fun removeLastRouteAnchor() {
+        routeJob?.cancel()
+        _state.update { state ->
+            val draft = state.routePlanner
+            val anchors = if (draft.anchors.size > 2) {
+                draft.anchors.toMutableList().apply { removeAt(lastIndex - 1) }
+            } else draft.anchors.dropLast(1)
+            state.copy(routePlanner = draft.copy(
+                anchors = anchors, candidates = emptyList(), selectedAlternative = null,
+                busy = false, requestToken = null,
+            ))
+        }
+    }
+
+    fun reverseRouteAnchors() {
+        routeJob?.cancel()
+        _state.update { state ->
+            val draft = state.routePlanner
+            val mode = when (draft.applyMode) {
+                RouteApplyMode.APPEND_TO_SELECTED -> RouteApplyMode.PREPEND_TO_SELECTED
+                RouteApplyMode.PREPEND_TO_SELECTED -> RouteApplyMode.APPEND_TO_SELECTED
+                RouteApplyMode.NEW_TRACK -> RouteApplyMode.NEW_TRACK
+            }
+            state.copy(routePlanner = draft.copy(
+                anchors = draft.anchors.reversed(), candidates = emptyList(), selectedAlternative = null,
+                applyMode = mode, busy = false, requestToken = null,
+            ))
+        }
+    }
+
+    fun setRouteApplyMode(mode: RouteApplyMode) {
+        _state.update { state ->
+            state.copy(routePlanner = state.routePlanner.copy(
+                applyMode = mode,
+                targetTrackId = if (mode == RouteApplyMode.NEW_TRACK) null else state.selectedTrackId,
+            ))
+        }
+    }
+
+    fun selectRouteCandidate(alternative: RouteAlternative) {
+        if (_state.value.routePlanner.candidates.any { it.alternative == alternative }) {
+            _state.update { it.copy(routePlanner = it.routePlanner.copy(selectedAlternative = alternative)) }
+        }
+    }
+
+    fun calculateRoutes() {
+        val original = _state.value.routePlanner
+        if (original.anchors.size < 2) {
+            _state.update { it.copy(routePlanner = original.copy(error = "Choose at least a start and end point.")) }
+            return
+        }
+        routeJob?.cancel()
+        val token = UUID.randomUUID().toString()
+        val profile = _state.value.bicycleProfile
+        val documentRevision = project?.documentRevision ?: 0L
+        val requestDraft = original.copy(
+            busy = true,
+            candidates = emptyList(),
+            selectedAlternative = null,
+            error = null,
+            requestToken = token,
+            sourceDocumentRevision = documentRevision,
+        )
+        _state.update { it.copy(routePlanner = requestDraft) }
+        routeJob = viewModelScope.launch {
+            val candidates = mutableListOf<RouteCandidate>()
+            var firstError: String? = null
+            RouteAlternative.entries.forEach { alternative ->
+                when (val outcome = router.route(RoutingRequest(requestDraft.anchors, profile, alternative))) {
+                    is RoutingOutcome.Success -> candidates += RouteCandidate(alternative, outcome.path)
+                    is RoutingOutcome.Failure -> if (firstError == null) firstError = outcome.reason.message
+                }
+            }
+            val current = _state.value.routePlanner
+            if (current.requestToken != token || current.anchors.map { it.id } != requestDraft.anchors.map { it.id } ||
+                _state.value.bicycleProfile != profile || project?.documentRevision != documentRevision
+            ) {
+                if (current.requestToken == token) {
+                    _state.update {
+                        it.copy(routePlanner = it.routePlanner.copy(
+                            busy = false, requestToken = null,
+                            error = "The route inputs changed; recalculate the preview.",
+                        ))
+                    }
+                }
+                return@launch
+            }
+            _state.update { state ->
+                state.copy(routePlanner = state.routePlanner.copy(
+                    busy = false,
+                    candidates = candidates,
+                    selectedAlternative = candidates.firstOrNull()?.alternative,
+                    error = if (candidates.isEmpty()) firstError ?: "No route was returned." else null,
+                ))
+            }
+        }
+    }
+
+    fun applyPlannedRoute(name: String = "Planned bicycle route") {
+        val draft = _state.value.routePlanner
+        val candidate = draft.candidates.firstOrNull { it.alternative == draft.selectedAlternative } ?: return
+        if (draft.sourceDocumentRevision != project?.documentRevision) {
+            _state.update {
+                it.copy(routePlanner = it.routePlanner.copy(
+                    candidates = emptyList(), selectedAlternative = null,
+                    error = "The project changed; recalculate before applying.",
+                ))
+            }
+            return
+        }
+        val points = candidate.path.points.map { it.toGpxPoint() }
+        val selected = draft.targetTrackId?.let { id -> _state.value.document.tracks.firstOrNull { it.id == id } }
+        when (draft.applyMode) {
+            RouteApplyMode.NEW_TRACK -> {
+                val track = GpxTrack(name = name, segments = listOf(GpxTrackSegment(points)))
+                commit(_state.value.document.copy(tracks = _state.value.document.tracks + track), selectedTrackId = track.id, message = "Added planned route as a new track.")
+            }
+            RouteApplyMode.APPEND_TO_SELECTED -> {
+                if (selected == null) {
+                    _state.update { it.copy(routePlanner = it.routePlanner.copy(error = "The append target is no longer available.")) }
+                    return
+                }
+                val segments = selected.segments.ifEmpty { listOf(GpxTrackSegment()) }
+                val last = segments.last()
+                val boundary = last.points.lastOrNull()
+                val close = boundary != null && points.firstOrNull()?.let { GeoMath.distanceMeters(boundary, it) <= 2.0 } == true
+                val updated = if (close) {
+                    selected.copy(segments = segments.dropLast(1) + last.copy(points = last.points + points.drop(1)))
+                } else selected.copy(segments = segments + GpxTrackSegment(points))
+                replaceTrack(
+                    updated,
+                    if (close) "Appended the planned route." else "Added the planned route as a new segment, preserving the endpoint gap.",
+                )
+            }
+            RouteApplyMode.PREPEND_TO_SELECTED -> {
+                if (selected == null) {
+                    _state.update { it.copy(routePlanner = it.routePlanner.copy(error = "The prepend target is no longer available.")) }
+                    return
+                }
+                val segments = selected.segments.ifEmpty { listOf(GpxTrackSegment()) }
+                val first = segments.first()
+                val boundary = first.points.firstOrNull()
+                val close = boundary != null && points.lastOrNull()?.let { GeoMath.distanceMeters(boundary, it) <= 2.0 } == true
+                val updated = if (close) {
+                    selected.copy(segments = listOf(first.copy(points = points.dropLast(1) + first.points)) + segments.drop(1))
+                } else selected.copy(segments = listOf(GpxTrackSegment(points)) + segments)
+                replaceTrack(
+                    updated,
+                    if (close) "Prepended the planned route." else "Added the planned route as a new leading segment, preserving the endpoint gap.",
+                )
+            }
+        }
+        _state.update { it.copy(routePlanner = RoutePlannerDraft()) }
+    }
+
     fun toggleTrackVisibility(id: String) {
         _state.update { state ->
             val style = state.styles[id] ?: defaultStyle(state.styles.size)
             state.copy(styles = state.styles + (id to style.copy(visible = !style.visible)))
         }
+        persistEditorState()
     }
 
     fun setTrackColor(id: String, color: Long) {
@@ -569,6 +1301,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             val style = state.styles[id] ?: defaultStyle(state.styles.size)
             state.copy(styles = state.styles + (id to style.copy(color = color)))
         }
+        persistEditorState()
     }
 
     private fun updatePoint(selection: PointSelection, transform: (GpxPoint) -> GpxPoint) {
@@ -592,6 +1325,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         message: String? = null,
     ) {
         if (document == _state.value.document) return
+        routeJob?.cancel()
         undo.addLast(_state.value.document)
         while (undo.size > 75) undo.removeFirst()
         redo.clear()
@@ -603,17 +1337,23 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 document = document,
                 styles = styles,
                 selectedTrackId = selectedTrackId,
+                selectedTrackIds = setOfNotNull(selectedTrackId),
+                selectionMode = false,
                 selectedPoint = null,
                 undoAvailable = true,
                 redoAvailable = false,
                 dirty = true,
                 message = message,
+                splitDraft = null,
+                joinDraft = null,
+                routePlanner = RoutePlannerDraft(),
             )
         }
-        autosave(document)
+        persistProject(documentChanged = true)
     }
 
     private fun replaceWithoutHistory(document: GpxDocument, message: String) {
+        routeJob?.cancel()
         val selected = _state.value.selectedTrackId?.takeIf { id -> document.tracks.any { it.id == id } }
             ?: document.tracks.firstOrNull()?.id
         _state.update {
@@ -621,27 +1361,134 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 document = document,
                 styles = stylesFor(document.tracks, it.styles),
                 selectedTrackId = selected,
+                selectedTrackIds = setOfNotNull(selected),
+                selectionMode = false,
                 selectedPoint = null,
                 undoAvailable = undo.isNotEmpty(),
                 redoAvailable = redo.isNotEmpty(),
                 dirty = true,
                 message = message,
+                splitDraft = null,
+                joinDraft = null,
+                routePlanner = RoutePlannerDraft(),
             )
         }
-        autosave(document)
+        persistProject(documentChanged = true)
     }
 
-    private fun autosave(document: GpxDocument) {
-        val generation = autosaveGeneration.incrementAndGet()
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                autosaveMutex.withLock {
-                    if (generation == autosaveGeneration.get()) store.saveAutosave(document)
-                }
-            }.onFailure { error ->
-                _state.update { it.copy(message = "Autosave failed: ${error.message}") }
-            }
+    private suspend fun loadProject(result: ProjectOpenResult) {
+        routeJob?.cancel()
+        joinJob?.cancel()
+        val closeError = runCatching { autosave?.close() }.exceptionOrNull()
+        if (closeError != null) {
+            _state.update { it.copy(loadingProject = false, message = "Could not save the current project: ${closeError.message}") }
+            return
         }
+        saveStatusJob?.cancel()
+        undo.clear()
+        redo.clear()
+        val opened = result.project
+        project = opened
+        val session = repository.autosaveSession(opened, viewModelScope)
+        autosave = session
+        val editor = opened.editor
+        val document = reorderTracks(opened.document, editor.layerOrder)
+        val selectedIds = editor.selectedTrackIds.filterTo(linkedSetOf()) { id -> document.tracks.any { it.id == id } }
+        val selected = editor.selectedTrackId?.takeIf { id -> document.tracks.any { it.id == id } }
+            ?: document.tracks.firstOrNull()?.id
+        _state.value = EditorUiState(
+            document = document,
+            styles = stylesFor(document.tracks, editor.styles),
+            selectedTrackId = selected,
+            selectedTrackIds = selectedIds.ifEmpty { setOfNotNull(selected) },
+            selectionMode = selectedIds.size > 1,
+            selectedPoint = editor.selectedPoint?.let { PointSelection(it.trackId, it.segmentIndex, it.pointIndex) },
+            panel = runCatching { EditorPanel.valueOf(editor.panelId) }.getOrDefault(EditorPanel.MAP),
+            bicycleProfile = BicycleProfile.entries.firstOrNull { it.id == editor.routingProfileId } ?: BicycleProfile.TOURING,
+            dirty = opened.isDocumentDirty,
+            recoveredAutosave = result.source == ProjectRecoverySource.SNAPSHOT || result.source == ProjectRecoverySource.LEGACY_AUTOSAVE,
+            loadingProject = false,
+            projectId = opened.id,
+            projectTitle = opened.title,
+            saveStatus = ProjectSaveStatus.Saved(opened.revision),
+            groups = editor.groups,
+            camera = editor.camera?.let { MapCameraState(it.latitude, it.longitude, it.zoom, it.bearing, it.pitch) },
+            message = result.warnings.firstOrNull(),
+        )
+        saveStatusJob = viewModelScope.launch {
+            session.status.collectLatest { status -> _state.update { it.copy(saveStatus = status) } }
+        }
+        refreshProjects()
+        if (pendingImports.isNotEmpty()) {
+            val queued = pendingImports.toList()
+            pendingImports.clear()
+            importUris(queued)
+        }
+    }
+
+    private suspend fun refreshProjects() {
+        runCatching { repository.listProjects() }
+            .onSuccess { projects -> _state.update { it.copy(projects = projects) } }
+    }
+
+    private fun persistEditorState() = persistProject(documentChanged = false)
+
+    private fun markProjectExported() {
+        val current = project ?: return
+        val exported = current.nextRevision(documentChanged = false).copy(
+            lastExportedDocumentRevision = current.documentRevision,
+        )
+        project = exported
+        autosave?.submit(exported)
+        _state.update { it.copy(dirty = false) }
+    }
+
+    private fun persistProject(documentChanged: Boolean) {
+        val current = project ?: return
+        val state = _state.value
+        val next = current.nextRevision(
+            document = state.document,
+            editor = ProjectEditorState(
+                layerOrder = state.document.tracks.map(GpxTrack::id),
+                styles = state.styles,
+                groups = state.groups,
+                selectedTrackId = state.selectedTrackId,
+                selectedTrackIds = state.selectedTrackIds.toList(),
+                selectedPoint = state.selectedPoint?.let { selection ->
+                    val point = state.document.tracks.firstOrNull { it.id == selection.trackId }
+                        ?.segments?.getOrNull(selection.segmentIndex)?.points?.getOrNull(selection.pointIndex)
+                    point?.let {
+                        ProjectSelection(
+                            selection.trackId,
+                            selection.segmentIndex,
+                            selection.pointIndex,
+                            (it.latitude * 10_000_000).toLong(),
+                            (it.longitude * 10_000_000).toLong(),
+                            it.time?.toEpochMilli(),
+                        )
+                    }
+                },
+                camera = state.camera?.let { ProjectCamera(it.latitude, it.longitude, it.zoom, it.bearing, it.tilt) },
+                routingProfileId = state.bicycleProfile.id,
+                panelId = state.panel.name,
+            ),
+            documentChanged = documentChanged,
+        )
+        project = next
+        autosave?.submit(next)
+        _state.update { it.copy(projectTitle = next.title, dirty = next.isDocumentDirty) }
+    }
+
+    private fun reorderTracks(document: GpxDocument, order: List<String>): GpxDocument {
+        if (order.isEmpty()) return document
+        val positions = order.withIndex().associate { it.value to it.index }
+        return document.copy(tracks = document.tracks.sortedBy { positions[it.id] ?: Int.MAX_VALUE })
+    }
+
+    private fun GpxTrack.endpoint(reversed: Boolean, atStart: Boolean): GpxPoint? {
+        val points = segments.flatMap { it.points }
+        if (points.isEmpty()) return null
+        return if (atStart xor reversed) points.first() else points.last()
     }
 
     private fun queryDisplayName(uri: Uri): String? {
