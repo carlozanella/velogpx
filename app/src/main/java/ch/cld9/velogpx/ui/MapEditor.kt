@@ -1,7 +1,13 @@
 package ch.cld9.velogpx.ui
 
 import android.content.Context
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.PointF
 import android.os.Bundle
+import android.view.MotionEvent
+import android.view.View
+import android.widget.FrameLayout
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
@@ -113,6 +119,8 @@ fun MapEditor(
     currentLocationProjection: ModelPoint? = null,
     onTracksTap: (List<String>, Double, Double) -> Unit = { _, latitude, longitude -> onMapTap(latitude, longitude) },
     trackPickingEnabled: Boolean = false,
+    lassoSelectionEnabled: Boolean = false,
+    onLassoSelection: (List<String>) -> Unit = {},
     focusRequest: MapFocusRequest? = null,
     initialCamera: MapCameraState? = null,
     onCameraIdle: (MapCameraState) -> Unit = {},
@@ -123,6 +131,22 @@ fun MapEditor(
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val mapView = remember { MapView(context).apply { onCreate(Bundle()) } }
     val renderer = remember { MapRenderer() }
+    val latestLassoSelection = remember { AtomicReference(onLassoSelection) }
+    latestLassoSelection.set(onLassoSelection)
+    val lassoOverlay = remember {
+        LassoOverlayView(context).apply { onComplete = { polygon ->
+            mapView.getMapAsync { map ->
+                latestLassoSelection.get().invoke(renderer.trackIdsInsideLasso(map, polygon))
+            }
+        } }
+    }
+    lassoOverlay.active = lassoSelectionEnabled
+    val mapContainer = remember {
+        FrameLayout(context).apply {
+            addView(mapView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            addView(lassoOverlay, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        }
+    }
     val latestPayload = remember {
         AtomicReference(MapPayload(document, styles, selectedTrackIds, selectedPoint, selectedPosition, currentLocation, currentLocationProjection, draftLines, draftAnchors))
     }
@@ -203,21 +227,21 @@ fun MapEditor(
 
     AndroidView(
         factory = {
-            mapView.apply {
-                addOnDidFailLoadingMapListener(loadFailure)
-                getMapAsync { map ->
-                    map.addOnMapClickListener(callback)
-                    map.addOnCameraIdleListener(cameraIdle)
-                    map.setStyle(Style.Builder().fromUri(MAP_STYLE)) { style ->
-                        renderer.sync(map, style, latestPayload.get())
-                        renderer.applyInitialCamera(map, initialCamera, latestPayload.get().document, mapView)
-                        latestFocus.get()?.let { renderer.focus(map, it, mapView) }
-                    }
+            mapView.addOnDidFailLoadingMapListener(loadFailure)
+            mapView.getMapAsync { map ->
+                map.addOnMapClickListener(callback)
+                map.addOnCameraIdleListener(cameraIdle)
+                map.setStyle(Style.Builder().fromUri(MAP_STYLE)) { style ->
+                    renderer.sync(map, style, latestPayload.get())
+                    renderer.applyInitialCamera(map, initialCamera, latestPayload.get().document, mapView)
+                    latestFocus.get()?.let { renderer.focus(map, it, mapView) }
                 }
             }
+            mapContainer
         },
-        update = { view ->
-            view.getMapAsync { map ->
+        update = {
+            lassoOverlay.active = lassoSelectionEnabled
+            mapView.getMapAsync { map ->
                 map.style?.let { style ->
                     renderer.sync(map, style, MapPayload(document, styles, selectedTrackIds, selectedPoint, selectedPosition, currentLocation, currentLocationProjection, draftLines, draftAnchors))
                     focusRequest?.let { renderer.focus(map, it, mapView) }
@@ -346,6 +370,29 @@ private class MapRenderer {
         return map.queryRenderedFeatures(area, *visibleTrackIds.map(::layerId).toTypedArray())
             .mapNotNull { feature -> feature.getStringProperty("trackId") }
             .distinct()
+    }
+
+    fun trackIdsInsideLasso(map: MapLibreMap, polygon: List<ScreenPoint>): List<String> {
+        if (polygon.size < 3 || visibleTrackIds.isEmpty()) return emptyList()
+        val left = polygon.minOf { it.x }.toFloat()
+        val top = polygon.minOf { it.y }.toFloat()
+        val right = polygon.maxOf { it.x }.toFloat()
+        val bottom = polygon.maxOf { it.y }.toFloat()
+        val candidates = map.queryRenderedFeatures(
+            android.graphics.RectF(left, top, right, bottom),
+            *visibleTrackIds.map(::layerId).toTypedArray(),
+        ).mapNotNull { it.getStringProperty("trackId") }.toSet()
+        return visibleTrackIds.filter { id ->
+            if (id !in candidates) return@filter false
+            val track = trackGeometry[id]?.first ?: return@filter false
+            track.segments.any { segment ->
+                val line = segment.points.map { point ->
+                    val screen = map.projection.toScreenLocation(LatLng(point.latitude, point.longitude))
+                    ScreenPoint(screen.x.toDouble(), screen.y.toDouble())
+                }
+                LassoGeometry.lineIntersectsPolygon(line, polygon)
+            }
+        }
     }
 
     private fun syncDraft(style: Style, lines: List<MapDraftLine>, anchors: List<ModelPoint>) {
@@ -531,4 +578,97 @@ private class MapRenderer {
     private fun layerId(id: String) = "velogpx-layer-$id"
     private fun haloLayerId(id: String) = "velogpx-halo-$id"
     private fun colorString(argb: Long) = String.format("#%06X", argb and 0xFFFFFF)
+}
+
+internal class LassoOverlayView(context: Context) : View(context) {
+    private val density = resources.displayMetrics.density
+    private val points = mutableListOf<PointF>()
+    private val lassoPath = Path()
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.rgb(123, 31, 162)
+        style = Paint.Style.STROKE
+        strokeWidth = 3f * density
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.argb(45, 123, 31, 162)
+        style = Paint.Style.FILL
+    }
+    var onComplete: (List<ScreenPoint>) -> Unit = {}
+
+    var active: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            visibility = if (value) VISIBLE else GONE
+            if (!value) {
+                points.clear()
+                invalidate()
+            }
+        }
+
+    init {
+        visibility = GONE
+        isClickable = true
+        contentDescription = "Draw a lasso around tracks"
+    }
+
+    override fun onDraw(canvas: android.graphics.Canvas) {
+        super.onDraw(canvas)
+        if (points.size < 2) return
+        lassoPath.reset()
+        lassoPath.moveTo(points.first().x, points.first().y)
+        for (index in 1 until points.size) lassoPath.lineTo(points[index].x, points[index].y)
+        if (points.size >= 3) {
+            lassoPath.close()
+            canvas.drawPath(lassoPath, fill)
+        }
+        canvas.drawPath(lassoPath, stroke)
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (!active) return false
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                parent?.requestDisallowInterceptTouchEvent(true)
+                points.clear()
+                points += PointF(event.x, event.y)
+                invalidate()
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val previous = points.lastOrNull()
+                val dx = event.x - (previous?.x ?: event.x)
+                val dy = event.y - (previous?.y ?: event.y)
+                if (dx * dx + dy * dy >= 4f * density * density) {
+                    points += PointF(event.x, event.y)
+                    invalidate()
+                }
+            }
+            MotionEvent.ACTION_UP -> {
+                performClick()
+                points += PointF(event.x, event.y)
+                val width = (points.maxOfOrNull { it.x } ?: 0f) - (points.minOfOrNull { it.x } ?: 0f)
+                val height = (points.maxOfOrNull { it.y } ?: 0f) - (points.minOfOrNull { it.y } ?: 0f)
+                val result = if (points.size >= 3 && width >= 12f * density && height >= 12f * density) {
+                    points.map { ScreenPoint(it.x.toDouble(), it.y.toDouble()) }
+                } else emptyList()
+                points.clear()
+                invalidate()
+                parent?.requestDisallowInterceptTouchEvent(false)
+                onComplete(result)
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                points.clear()
+                invalidate()
+                parent?.requestDisallowInterceptTouchEvent(false)
+            }
+        }
+        return true
+    }
+
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
+    }
 }

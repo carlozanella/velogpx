@@ -9,6 +9,7 @@ import ch.cld9.velogpx.model.GpxTrackSegment
 import ch.cld9.velogpx.model.TrackStyle
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Rule
 import org.junit.Test
@@ -109,6 +110,26 @@ class ProjectArchiveCodecTest {
         val loaded = ProjectArchiveCodec().read(legacy)
 
         assertEquals(listOf(track.id), loaded.editor.selectedTrackIds)
+    }
+
+    @Test fun archiveRoundTripPreservesAnExplicitlyEmptySelection() {
+        val track = GpxTrack(
+            name = "EV 5",
+            segments = listOf(GpxTrackSegment(listOf(GpxPoint(47.0, 8.0)))),
+            id = "unselected-track",
+        )
+        val original = ProjectState.create(
+            title = "Deselected map",
+            document = GpxDocument(tracks = listOf(track)),
+            now = Instant.EPOCH,
+        ).copy(editor = ProjectEditorState(layerOrder = listOf(track.id)))
+        val file = temporary.newFile("deselected.velogpx")
+        FileOutputStream(file).use { ProjectArchiveCodec().write(original, it) }
+
+        val loaded = ProjectArchiveCodec().read(file)
+
+        assertNull(loaded.editor.selectedTrackId)
+        assertEquals(emptyList<String>(), loaded.editor.selectedTrackIds)
     }
 
     private fun rewriteManifest(source: File, target: File, transform: (JSONObject) -> JSONObject) {

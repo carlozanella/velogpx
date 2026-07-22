@@ -27,6 +27,8 @@ import ch.cld9.velogpx.engine.StagePlanner
 import ch.cld9.velogpx.engine.TrackLocation
 import ch.cld9.velogpx.engine.TrackPosition
 import ch.cld9.velogpx.engine.TrackPositionEngine
+import ch.cld9.velogpx.engine.TrackSelectionProfile
+import ch.cld9.velogpx.engine.TrackSelectionProfileEngine
 import ch.cld9.velogpx.engine.TrackDeduplicator
 import ch.cld9.velogpx.engine.TrackRangeEngine
 import ch.cld9.velogpx.engine.TrackStatistics
@@ -125,6 +127,7 @@ data class EditorUiState(
     val selectedTrackId: String? = null,
     val selectedTrackIds: Set<String> = emptySet(),
     val selectionMode: Boolean = false,
+    val lassoSelectionActive: Boolean = false,
     val selectedPoint: PointSelection? = null,
     val selectedCursor: TrackCursor? = null,
     val editMode: EditMode = EditMode.SELECT,
@@ -254,6 +257,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         _state.update {
             it.copy(
                 editMode = mode,
+                lassoSelectionActive = false,
                 message = null,
                 splitDraft = if (mode == EditMode.SPLIT) it.splitDraft else null,
             )
@@ -261,7 +265,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun setPanel(panel: EditorPanel) {
-        _state.update { it.copy(panel = panel) }
+        _state.update { it.copy(panel = panel, lassoSelectionActive = it.lassoSelectionActive && panel == EditorPanel.MAP) }
         persistEditorState()
     }
 
@@ -343,6 +347,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             val valid = initialTrackId?.takeIf { id -> state.document.tracks.any { it.id == id } }
             state.copy(
                 selectionMode = true,
+                lassoSelectionActive = false,
                 selectedTrackIds = valid?.let(::setOf) ?: emptySet(),
                 selectedTrackId = valid,
                 selectedPoint = null,
@@ -350,13 +355,20 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 editMode = EditMode.SELECT,
             )
         }
+        refreshCurrentLocationProjection()
+        persistEditorState()
     }
 
     fun exitSelectionMode() {
         _state.update { state ->
             val primary = state.selectedTrackId?.takeIf { it in state.selectedTrackIds }
                 ?: state.selectedTrackIds.firstOrNull()
-            state.copy(selectionMode = false, selectedTrackIds = setOfNotNull(primary), selectedTrackId = primary)
+            state.copy(
+                selectionMode = false,
+                lassoSelectionActive = false,
+                selectedTrackIds = setOfNotNull(primary),
+                selectedTrackId = primary,
+            )
         }
         persistEditorState()
     }
@@ -380,17 +392,61 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         persistEditorState()
     }
 
-    fun selectProfileDistance(distanceMeters: Double) {
-        val track = _state.value.selectedTrack ?: return
-        val position = TrackPositionEngine.atDistance(track, distanceMeters) ?: return
+    fun toggleLassoSelection() {
+        if (!_state.value.selectionMode) enterSelectionMode()
         _state.update {
             it.copy(
-                selectedCursor = TrackCursor(position, TrackCursorSource.PROFILE),
-                selectedPoint = position.sourcePointIndex?.let { pointIndex ->
-                    PointSelection(track.id, position.segmentIndex, pointIndex)
+                lassoSelectionActive = !it.lassoSelectionActive,
+                editMode = EditMode.SELECT,
+                message = null,
+            )
+        }
+    }
+
+    fun selectTracksByLasso(trackIds: List<String>) {
+        val state = _state.value
+        val valid = state.document.tracks.map(GpxTrack::id).filter { it in trackIds }.toSet()
+        if (valid.isEmpty()) {
+            _state.update { it.copy(lassoSelectionActive = false, message = "No visible tracks crossed the lasso.") }
+            return
+        }
+        val newlySelected = valid - state.selectedTrackIds
+        _state.update {
+            val selected = it.selectedTrackIds + valid
+            it.copy(
+                selectionMode = true,
+                lassoSelectionActive = false,
+                selectedTrackIds = selected,
+                selectedTrackId = it.selectedTrackId?.takeIf(selected::contains) ?: valid.first(),
+                selectedPoint = null,
+                selectedCursor = null,
+                message = if (newlySelected.isEmpty()) {
+                    "Every track inside the lasso was already selected."
+                } else {
+                    "Selected ${newlySelected.size} track${if (newlySelected.size == 1) "" else "s"} with the lasso."
                 },
             )
         }
+        refreshCurrentLocationProjection()
+        persistEditorState()
+    }
+
+    fun selectProfileDistance(distanceMeters: Double) {
+        val state = _state.value
+        val combined = combinedSelectionProfile(state)
+        val position = combined?.sourcePositionAtDistance(distanceMeters)
+            ?: state.selectedTrack?.let { TrackPositionEngine.atDistance(it, distanceMeters) }
+            ?: return
+        _state.update {
+            it.copy(
+                selectedTrackId = position.trackId,
+                selectedCursor = TrackCursor(position, TrackCursorSource.PROFILE),
+                selectedPoint = position.sourcePointIndex?.let { pointIndex ->
+                    PointSelection(position.trackId, position.segmentIndex, pointIndex)
+                },
+            )
+        }
+        refreshCurrentLocationProjection()
         persistEditorState()
     }
 
@@ -743,8 +799,18 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             EditMode.WAYPOINT -> addWaypoint(point)
             EditMode.MOVE -> moveSelectedPoint(point)
             EditMode.SPLIT -> addSplitCut(point)
-            EditMode.SELECT -> selectNearestPoint(point)
+            EditMode.SELECT -> clearMapSelection()
         }
+    }
+
+    /** Called only when MapLibre found no rendered track inside the map's tap corridor. */
+    private fun clearMapSelection() {
+        val state = _state.value
+        if (state.selectedTrackId == null && state.selectedTrackIds.isEmpty() &&
+            state.selectedPoint == null && state.selectedCursor == null
+        ) return
+        _state.update(EditorUiState::withMapSelectionCleared)
+        persistEditorState()
     }
 
     private fun appendPoint(point: GpxPoint) {
@@ -785,18 +851,6 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 }
             }
         }
-    }
-
-    private fun selectNearestPoint(query: GpxPoint) {
-        val nearest = _state.value.document.tracks.asSequence()
-            .filter { _state.value.styles[it.id]?.visible != false }
-            .mapNotNull { track -> TrackPositionEngine.project(track, query)?.let { track to it } }
-            .minByOrNull { it.second.distanceToTrackMeters }
-        if (nearest == null) {
-            _state.update { it.copy(message = "There are no track lines to select.") }
-        } else if (nearest.second.distanceToTrackMeters > 500.0) {
-            _state.update { it.copy(message = "No track is within 500 m. Zoom in and tap closer to the route.") }
-        } else selectPositionOnTrack(nearest.first.id, query)
     }
 
     private fun selectPositionOnTrack(trackId: String, query: GpxPoint) {
@@ -1619,7 +1673,6 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         val document = reorderTracks(opened.document, editor.layerOrder)
         val selectedIds = editor.selectedTrackIds.filterTo(linkedSetOf()) { id -> document.tracks.any { it.id == id } }
         val selected = editor.selectedTrackId?.takeIf { id -> document.tracks.any { it.id == id } }
-            ?: document.tracks.firstOrNull()?.id
         val restoredSelection = editor.selectedPoint?.let { PointSelection(it.trackId, it.segmentIndex, it.pointIndex) }
         val restoredCursor = restoredSelection?.let { selection ->
             document.tracks.firstOrNull { it.id == selection.trackId }
@@ -1762,14 +1815,24 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     private fun refreshCurrentLocationProjection() {
         val state = _state.value
         val location = state.currentLocation
-        val track = state.selectedTrack
-        val projection = if (location != null && track != null) {
-            TrackPositionEngine.project(track, location.point)
+        val selectedIds = state.selectedTrackIds.takeIf { state.selectionMode && it.size > 1 }
+        val tracks = if (selectedIds != null) {
+            state.document.tracks.filter { it.id in selectedIds }
+        } else listOfNotNull(state.selectedTrack)
+        val projection = location?.let { current ->
+            tracks.mapNotNull { TrackPositionEngine.project(it, current.point) }
+                .minByOrNull(TrackPosition::distanceToTrackMeters)
                 ?.takeIf { it.distanceToTrackMeters <= LOCATION_ROUTE_THRESHOLD_METERS }
-        } else null
+        }
         if (projection != state.currentLocationProjection) {
             _state.update { it.copy(currentLocationProjection = projection) }
         }
+    }
+
+    private fun combinedSelectionProfile(state: EditorUiState): TrackSelectionProfile? {
+        val ids = state.selectedTrackIds
+        if (!state.selectionMode || ids.size < 2) return null
+        return runCatching { TrackSelectionProfileEngine.build(state.document.tracks, ids) }.getOrNull()
     }
 
     override fun onCleared() {

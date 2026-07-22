@@ -45,6 +45,9 @@ fun TrackProfileCard(
     onDistanceSelected: (Double) -> Unit,
     modifier: Modifier = Modifier,
     expanded: Boolean = false,
+    profileTitle: String? = null,
+    positionDistanceMeters: ((TrackPosition) -> Double?)? = null,
+    positionTrackName: ((String) -> String?)? = null,
 ) {
     val profile = remember(track) { TrackPositionEngine.profile(track) }
     val chartRuns = remember(profile) { profile.chartRuns(MAX_CHART_SAMPLES) }
@@ -55,6 +58,11 @@ fun TrackProfileCard(
     val routeColor = MaterialTheme.colorScheme.primary
     val cursorColor = Color(0xFFC2185B)
     val locationColor = Color(0xFF1565C0)
+    fun displayDistance(position: TrackPosition): Double? =
+        positionDistanceMeters?.invoke(position)
+            ?: position.distanceAlongMeters.takeIf { position.trackId == track.id }
+    val selectedDisplayDistance = selectedCursor?.position?.let(::displayDistance)
+    val locationDisplayDistance = currentLocationProjection?.let(::displayDistance)
     val labelPaint = remember {
         Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = android.graphics.Typeface.create("sans", android.graphics.Typeface.NORMAL) }
     }
@@ -63,7 +71,7 @@ fun TrackProfileCard(
         Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
             Row(Modifier.fillMaxWidth()) {
                 Text(
-                    track.name ?: "Selected track",
+                    profileTitle ?: track.name ?: "Selected track",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
@@ -125,9 +133,9 @@ fun TrackProfileCard(
                     drawText(end, right - labelPaint.measureText(end), size.height - 2.dp.toPx(), labelPaint)
                 }
 
-                fun cursorLine(position: TrackPosition?, color: Color, label: String) {
-                    if (position == null || position.trackId != track.id) return
-                    val x = left + (position.distanceAlongMeters / total).toFloat().coerceIn(0f, 1f) * chartWidth
+                fun cursorLine(distanceMeters: Double?, color: Color, label: String) {
+                    if (distanceMeters == null) return
+                    val x = left + (distanceMeters / total).toFloat().coerceIn(0f, 1f) * chartWidth
                     drawLine(color, Offset(x, top), Offset(x, bottom), 2.dp.toPx())
                     labelPaint.color = color.toArgbCompat()
                     labelPaint.typeface = android.graphics.Typeface.create("sans", android.graphics.Typeface.BOLD)
@@ -135,15 +143,15 @@ fun TrackProfileCard(
                     drawContext.canvas.nativeCanvas.drawText(label, labelX, top - 3.dp.toPx(), labelPaint)
                     labelPaint.typeface = android.graphics.Typeface.DEFAULT
                 }
-                cursorLine(selectedCursor?.position, cursorColor, selectedCursor?.position?.let { formatProfileDistance(it.distanceAlongMeters) }.orEmpty())
-                cursorLine(currentLocationProjection, locationColor, currentLocationProjection?.let { "You ${formatProfileDistance(it.distanceAlongMeters)}" }.orEmpty())
+                cursorLine(selectedDisplayDistance, cursorColor, selectedDisplayDistance?.let(::formatProfileDistance).orEmpty())
+                cursorLine(locationDisplayDistance, locationColor, locationDisplayDistance?.let { "You ${formatProfileDistance(it)}" }.orEmpty())
             }
 
-            selectedCursor?.takeIf { it.position.trackId == track.id }?.let { cursor ->
+            selectedCursor?.takeIf { selectedDisplayDistance != null }?.let { cursor ->
                 val position = cursor.position
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        if (position.sourcePointIndex != null) {
+                        positionTrackName?.invoke(position.trackId)?.let { "$it · " }.orEmpty() + if (position.sourcePointIndex != null) {
                             "Point ${position.sourcePointIndex + 1} · segment ${position.segmentIndex + 1}"
                         } else {
                             "Between points ${position.edgeStartPointIndex + 1}–${position.edgeStartPointIndex + 2}"
@@ -151,7 +159,7 @@ fun TrackProfileCard(
                         style = MaterialTheme.typography.labelMedium,
                         color = cursorColor,
                     )
-                    Text("${formatProfileDistance(position.distanceAlongMeters)} from start", style = MaterialTheme.typography.labelMedium)
+                    Text("${formatProfileDistance(requireNotNull(selectedDisplayDistance))} from start", style = MaterialTheme.typography.labelMedium)
                     position.point.elevation?.let { Text("${it.toInt()} m", style = MaterialTheme.typography.labelMedium) }
                 }
                 Text(
@@ -164,13 +172,13 @@ fun TrackProfileCard(
                 )
             } ?: Text("Tap the profile or route for exact distance, elevation, and coordinates.", style = MaterialTheme.typography.bodySmall)
 
-            currentLocationProjection?.takeIf { it.trackId == track.id }?.let { position ->
+            currentLocationProjection?.takeIf { locationDisplayDistance != null }?.let { position ->
                 Spacer(Modifier.height(2.dp))
                 Row {
                     Text("You", color = locationColor, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
                     Spacer(Modifier.width(6.dp))
                     Text(
-                        "${formatProfileDistance(position.distanceAlongMeters)} · ${position.distanceToTrackMeters.toInt()} m from route",
+                        "${formatProfileDistance(requireNotNull(locationDisplayDistance))} · ${position.distanceToTrackMeters.toInt()} m from route",
                         style = MaterialTheme.typography.labelMedium,
                     )
                 }
