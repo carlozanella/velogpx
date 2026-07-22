@@ -1,6 +1,7 @@
 package ch.cld9.velogpx.ui
 
 import android.app.Application
+import android.location.Location
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -24,10 +25,14 @@ import ch.cld9.velogpx.engine.JoinPlanner
 import ch.cld9.velogpx.engine.ReverseTimePolicy
 import ch.cld9.velogpx.engine.StagePlanner
 import ch.cld9.velogpx.engine.TrackLocation
+import ch.cld9.velogpx.engine.TrackPosition
+import ch.cld9.velogpx.engine.TrackPositionEngine
+import ch.cld9.velogpx.engine.TrackDeduplicator
 import ch.cld9.velogpx.engine.TrackRangeEngine
 import ch.cld9.velogpx.engine.TrackStatistics
 import ch.cld9.velogpx.io.GpxParser
 import ch.cld9.velogpx.io.GpxWriter
+import ch.cld9.velogpx.location.DeviceLocationTracker
 import ch.cld9.velogpx.model.GpxDocument
 import ch.cld9.velogpx.model.GpxMetadata
 import ch.cld9.velogpx.model.GpxPoint
@@ -83,8 +88,8 @@ data class SplitDraft(val trackId: String, val cuts: List<TrackLocation>, val so
 
 data class JoinDraft(
     val plan: JoinPlan,
-    val keepOriginals: Boolean = true,
-    val name: String = "Joined route",
+    val keepOriginals: Boolean = false,
+    val name: String = "Merged route",
     val sourceDocumentRevision: Long,
 )
 
@@ -101,6 +106,19 @@ data class PointSelection(
     val pointIndex: Int,
 )
 
+enum class TrackCursorSource { MAP, PROFILE, RECORDED_POINT }
+
+data class TrackCursor(
+    val position: TrackPosition,
+    val source: TrackCursorSource,
+)
+
+data class CurrentDeviceLocation(
+    val point: GpxPoint,
+    val accuracyMeters: Float,
+    val recordedAtMillis: Long,
+)
+
 data class EditorUiState(
     val document: GpxDocument = GpxDocument(metadata = GpxMetadata(name = "Untitled bicycle tour")),
     val styles: Map<String, TrackStyle> = emptyMap(),
@@ -108,6 +126,7 @@ data class EditorUiState(
     val selectedTrackIds: Set<String> = emptySet(),
     val selectionMode: Boolean = false,
     val selectedPoint: PointSelection? = null,
+    val selectedCursor: TrackCursor? = null,
     val editMode: EditMode = EditMode.SELECT,
     val panel: EditorPanel = EditorPanel.MAP,
     val bicycleProfile: BicycleProfile = BicycleProfile.TOURING,
@@ -129,6 +148,12 @@ data class EditorUiState(
     val joinDraft: JoinDraft? = null,
     val routePlanner: RoutePlannerDraft = RoutePlannerDraft(),
     val mapTrackChoice: MapTrackChoice? = null,
+    val currentLocation: CurrentDeviceLocation? = null,
+    val currentLocationProjection: TrackPosition? = null,
+    val locationTracking: Boolean = false,
+    val importOfferUris: List<Uri> = emptyList(),
+    val layersScrollIndex: Int = 0,
+    val layersScrollOffset: Int = 0,
 ) {
     val selectedTrack: GpxTrack? get() = document.tracks.firstOrNull { it.id == selectedTrackId }
     val selectedStatistics: TrackStatistics? get() = selectedTrack?.let(GpxAnalytics::statistics)
@@ -203,6 +228,15 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     private val pendingImports = mutableListOf<Uri>()
     private val _state = MutableStateFlow(EditorUiState())
     val state: StateFlow<EditorUiState> = _state.asStateFlow()
+    private var focusWhenLocationArrives = false
+    private var locationRequested = false
+    private val locationTracker by lazy {
+        DeviceLocationTracker(
+            getApplication(),
+            onLocation = ::onDeviceLocation,
+            onError = { message -> _state.update { it.copy(locationTracking = false, message = message) } },
+        )
+    }
 
     init {
         viewModelScope.launch {
@@ -228,6 +262,14 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setPanel(panel: EditorPanel) {
         _state.update { it.copy(panel = panel) }
+        persistEditorState()
+    }
+
+    fun rememberLayersScroll(index: Int, offset: Int) {
+        val safeIndex = index.coerceAtLeast(0)
+        val safeOffset = offset.coerceAtLeast(0)
+        if (_state.value.layersScrollIndex == safeIndex && _state.value.layersScrollOffset == safeOffset) return
+        _state.update { it.copy(layersScrollIndex = safeIndex, layersScrollOffset = safeOffset) }
         persistEditorState()
     }
 
@@ -264,14 +306,16 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             }
         } else if (_state.value.editMode == EditMode.SPLIT) {
             addSplitCutOnTrack(valid, latitude, longitude)
-        } else selectTracksFromMap(valid)
+        } else if (_state.value.selectionMode) selectTracksFromMap(valid)
+        else selectPositionOnTrack(valid.first(), GpxPoint(latitude, longitude))
     }
 
     fun chooseMapTrack(trackId: String) {
         val choice = _state.value.mapTrackChoice ?: return
         _state.update { it.copy(mapTrackChoice = null) }
         if (choice.forSplit) addSplitCutOnTrack(listOf(trackId), choice.latitude, choice.longitude)
-        else selectTracksFromMap(listOf(trackId))
+        else if (_state.value.selectionMode) selectTracksFromMap(listOf(trackId))
+        else selectPositionOnTrack(trackId, GpxPoint(choice.latitude, choice.longitude))
     }
 
     fun dismissMapTrackChoice() = _state.update { it.copy(mapTrackChoice = null) }
@@ -284,18 +328,27 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 selectedTrackId = id,
                 selectedTrackIds = selectedIds,
                 selectedPoint = null,
+                selectedCursor = null,
                 panel = EditorPanel.MAP,
                 styles = if (focus) state.styles + (id to (state.styles[id] ?: defaultStyle(state.styles.size)).copy(visible = true)) else state.styles,
-                focusRequest = if (focus) MapFocusRequest(focusGeneration.incrementAndGet(), track.segments.flatMap { it.points }) else state.focusRequest,
+                focusRequest = if (focus) MapFocusRequest(focusGeneration.incrementAndGet(), track.segments.flatMap { it.points }, PROFILE_MAP_INSET_DP) else state.focusRequest,
             )
         }
+        refreshCurrentLocationProjection()
         persistEditorState()
     }
 
     fun enterSelectionMode(initialTrackId: String? = _state.value.selectedTrackId) {
         _state.update { state ->
             val valid = initialTrackId?.takeIf { id -> state.document.tracks.any { it.id == id } }
-            state.copy(selectionMode = true, selectedTrackIds = valid?.let(::setOf) ?: emptySet(), selectedTrackId = valid)
+            state.copy(
+                selectionMode = true,
+                selectedTrackIds = valid?.let(::setOf) ?: emptySet(),
+                selectedTrackId = valid,
+                selectedPoint = null,
+                selectedCursor = null,
+                editMode = EditMode.SELECT,
+            )
         }
     }
 
@@ -320,10 +373,60 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 selectedTrackIds = selected,
                 selectedTrackId = primary,
                 selectedPoint = null,
-                focusRequest = if (focus && id in selected) MapFocusRequest(focusGeneration.incrementAndGet(), track.segments.flatMap { it.points }) else state.focusRequest,
+                selectedCursor = null,
+                focusRequest = if (focus && id in selected) MapFocusRequest(focusGeneration.incrementAndGet(), track.segments.flatMap { it.points }, PROFILE_MAP_INSET_DP) else state.focusRequest,
             )
         }
         persistEditorState()
+    }
+
+    fun selectProfileDistance(distanceMeters: Double) {
+        val track = _state.value.selectedTrack ?: return
+        val position = TrackPositionEngine.atDistance(track, distanceMeters) ?: return
+        _state.update {
+            it.copy(
+                selectedCursor = TrackCursor(position, TrackCursorSource.PROFILE),
+                selectedPoint = position.sourcePointIndex?.let { pointIndex ->
+                    PointSelection(track.id, position.segmentIndex, pointIndex)
+                },
+            )
+        }
+        persistEditorState()
+    }
+
+    fun startLocationTracking(focusWhenAvailable: Boolean = true): Boolean {
+        focusWhenLocationArrives = focusWhenAvailable
+        if (!locationTracker.hasPermission()) return false
+        locationRequested = true
+        val started = locationTracker.start()
+        _state.update { it.copy(locationTracking = started) }
+        if (started && focusWhenAvailable) _state.value.currentLocation?.let { focusLocation(it.point) }
+        return started
+    }
+
+    fun onLocationPermissionDenied() {
+        _state.update { it.copy(message = "Location permission was not granted. Your routes remain fully usable offline.") }
+    }
+
+    fun stopLocationTracking() {
+        locationRequested = false
+        locationTracker.stop()
+        _state.update { it.copy(locationTracking = false) }
+    }
+
+    fun pauseLocationForBackground() {
+        locationTracker.stop()
+        _state.update { it.copy(locationTracking = false) }
+    }
+
+    fun resumeLocationForForeground() {
+        if (!locationRequested || !locationTracker.hasPermission()) return
+        _state.update { it.copy(locationTracking = locationTracker.start()) }
+    }
+
+    fun focusCurrentLocation() {
+        val point = _state.value.currentLocation?.point
+        if (point == null) focusWhenLocationArrives = true else focusLocation(point)
     }
 
     fun selectAllTracks() {
@@ -338,7 +441,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         val ids = _state.value.selectedTrackIds.ifEmpty { setOfNotNull(_state.value.selectedTrackId) }
         val points = _state.value.document.tracks.filter { it.id in ids }.flatMap { it.segments }.flatMap { it.points }
         if (points.isEmpty()) return
-        _state.update { it.copy(panel = EditorPanel.MAP, focusRequest = MapFocusRequest(focusGeneration.incrementAndGet(), points)) }
+        _state.update { it.copy(panel = EditorPanel.MAP, focusRequest = MapFocusRequest(focusGeneration.incrementAndGet(), points, PROFILE_MAP_INSET_DP)) }
         persistEditorState()
     }
 
@@ -356,6 +459,22 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             _state.update { it.copy(message = "GPX import queued until the project finishes opening.") }
             return
         }
+        _state.update { it.copy(importOfferUris = uris.distinct()) }
+    }
+
+    fun dismissImportOffer() = _state.update { it.copy(importOfferUris = emptyList()) }
+
+    fun confirmImportIntoCurrentProject() = confirmImport(intoNewProject = false)
+    fun confirmImportAsNewProject() = confirmImport(intoNewProject = true)
+
+    private fun confirmImport(intoNewProject: Boolean) {
+        val uris = _state.value.importOfferUris
+        if (uris.isEmpty()) return
+        _state.update { it.copy(importOfferUris = emptyList()) }
+        performImport(uris, intoNewProject)
+    }
+
+    private fun performImport(uris: List<Uri>, intoNewProject: Boolean) {
         _state.update { it.copy(busy = true, message = "Importing ${uris.size} file${if (uris.size == 1) "" else "s"}…") }
         viewModelScope.launch {
             val results = runCatching {
@@ -376,20 +495,96 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 _state.update { it.copy(busy = false, message = errors.firstOrNull()?.message ?: "No valid GPX data was found.") }
                 return@launch
             }
-            val current = _state.value.document
-            val base = if (current.isEmpty) documents.first() else current
-            val rest = if (current.isEmpty) documents.drop(1) else documents
+            val current = if (intoNewProject) GpxDocument() else _state.value.document
+            val seenTracks = current.tracks.mapTo(mutableSetOf(), TrackDeduplicator::fingerprint)
+            val seenRoutes = current.routes.mapTo(mutableSetOf(), TrackDeduplicator::routeFingerprint)
+            val seenWaypoints = current.waypoints.mapTo(mutableSetOf(), TrackDeduplicator::waypointFingerprint)
+            var duplicateTrackCount = 0
+            var duplicateRouteCount = 0
+            var duplicateWaypointCount = 0
+            val filteredDocuments = documents.map { document ->
+                val novelTracks = document.tracks.filter { track ->
+                    if (seenTracks.add(TrackDeduplicator.fingerprint(track))) true
+                    else { duplicateTrackCount++; false }
+                }
+                val novelRoutes = document.routes.filter { route ->
+                    if (seenRoutes.add(TrackDeduplicator.routeFingerprint(route))) true
+                    else { duplicateRouteCount++; false }
+                }
+                val novelWaypoints = document.waypoints.filter { waypoint ->
+                    if (seenWaypoints.add(TrackDeduplicator.waypointFingerprint(waypoint))) true
+                    else { duplicateWaypointCount++; false }
+                }
+                document.copy(tracks = novelTracks, routes = novelRoutes, waypoints = novelWaypoints)
+            }
+            val duplicateCount = duplicateTrackCount + duplicateRouteCount + duplicateWaypointCount
+            val documentsWithData = filteredDocuments.filterNot { it.isEmpty }
+            if (documentsWithData.isEmpty()) {
+                _state.update {
+                    it.copy(
+                        busy = false,
+                        message = if (duplicateCount > 0) {
+                            "Nothing imported: $duplicateCount duplicate GPX item${if (duplicateCount == 1) " was" else "s were"} already present."
+                        } else "No GPX geometry was found.",
+                    )
+                }
+                return@launch
+            }
+            val base = if (current.isEmpty) documentsWithData.first() else current
+            val rest = if (current.isEmpty) documentsWithData.drop(1) else documentsWithData
             val merged = GpxOperations.mergeDocuments(base, rest)
-            commit(
-                merged.value,
-                message = buildString {
-                    append("Imported ${documents.size} file${if (documents.size == 1) "" else "s"}")
-                    val warningCount = errors.size + merged.warnings.size
-                    if (warningCount > 0) append(" with $warningCount warning${if (warningCount == 1) "" else "s"}")
-                    append('.')
-                },
-            )
-            _state.update { it.copy(busy = false) }
+            val usedGroupNames = (if (intoNewProject) emptyList() else _state.value.groups.map(ProjectLayerGroup::name)).toMutableSet()
+            val importedGroups = filteredDocuments.mapNotNull { document ->
+                val ids = document.tracks.map(GpxTrack::id)
+                if (ids.isEmpty()) null else ProjectLayerGroup(
+                    name = uniqueGroupName(importGroupName(document), usedGroupNames),
+                    layerIds = ids,
+                )
+            }
+            val importedPoints = filteredDocuments.flatMap { document ->
+                document.tracks.flatMap { track -> track.segments.flatMap { it.points } }
+            }
+            val firstImportedTrackId = filteredDocuments.asSequence().flatMap { it.tracks.asSequence() }.firstOrNull()?.id
+            val message = buildString {
+                append("Imported ${documents.size} file${if (documents.size == 1) "" else "s"}")
+                if (importedGroups.isNotEmpty()) append(" into ${importedGroups.size} source group${if (importedGroups.size == 1) "" else "s"}")
+                if (duplicateCount > 0) append("; skipped $duplicateCount duplicate GPX item${if (duplicateCount == 1) "" else "s"}")
+                val warningCount = errors.size + merged.warnings.size
+                if (warningCount > 0) append("; $warningCount warning${if (warningCount == 1) "" else "s"}")
+                append('.')
+            }
+            if (intoNewProject) {
+                val title = importGroupName(documents.first()).ifBlank { "Imported bicycle tour" }
+                val created = runCatching { repository.create(title, merged.value) }.getOrElse { error ->
+                    _state.update { it.copy(busy = false, message = "Could not create the imported project: ${error.message}") }
+                    return@launch
+                }
+                loadProject(ProjectOpenResult(created, ProjectRecoverySource.NEW_PROJECT))
+                _state.update {
+                    it.copy(
+                        groups = importedGroups,
+                        message = message,
+                        busy = false,
+                        panel = EditorPanel.MAP,
+                        focusRequest = importedPoints.takeIf { points -> points.isNotEmpty() }
+                            ?.let { points -> MapFocusRequest(focusGeneration.incrementAndGet(), points, PROFILE_MAP_INSET_DP) },
+                    )
+                }
+                persistEditorState()
+            } else {
+                val previousGroups = _state.value.groups
+                commit(merged.value, selectedTrackId = firstImportedTrackId ?: _state.value.selectedTrackId, message = message)
+                _state.update {
+                    it.copy(
+                        groups = previousGroups + importedGroups,
+                        busy = false,
+                        panel = EditorPanel.MAP,
+                        focusRequest = importedPoints.takeIf { points -> points.isNotEmpty() }
+                            ?.let { points -> MapFocusRequest(focusGeneration.incrementAndGet(), points, PROFILE_MAP_INSET_DP) },
+                    )
+                }
+                persistEditorState()
+            }
         }
     }
 
@@ -593,27 +788,41 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun selectNearestPoint(query: GpxPoint) {
-        var nearest: Pair<PointSelection, Double>? = null
-        _state.value.document.tracks.forEach { track ->
-            track.segments.forEachIndexed { segmentIndex, segment ->
-                segment.points.forEachIndexed { pointIndex, point ->
-                    val distance = GeoMath.distanceMeters(query, point)
-                    if (nearest == null || distance < nearest!!.second) {
-                        nearest = PointSelection(track.id, segmentIndex, pointIndex) to distance
-                    }
-                }
-            }
+        val nearest = _state.value.document.tracks.asSequence()
+            .filter { _state.value.styles[it.id]?.visible != false }
+            .mapNotNull { track -> TrackPositionEngine.project(track, query)?.let { track to it } }
+            .minByOrNull { it.second.distanceToTrackMeters }
+        if (nearest == null) {
+            _state.update { it.copy(message = "There are no track lines to select.") }
+        } else if (nearest.second.distanceToTrackMeters > 500.0) {
+            _state.update { it.copy(message = "No track is within 500 m. Zoom in and tap closer to the route.") }
+        } else selectPositionOnTrack(nearest.first.id, query)
+    }
+
+    private fun selectPositionOnTrack(trackId: String, query: GpxPoint) {
+        val track = _state.value.document.tracks.firstOrNull { it.id == trackId } ?: return
+        val position = TrackPositionEngine.project(track, query) ?: return
+        val segment = track.segments.getOrNull(position.segmentIndex)
+        val sourceSelection = position.sourcePointIndex?.let { pointIndex ->
+            PointSelection(trackId, position.segmentIndex, pointIndex)
+        } ?: run {
+            val startIndex = position.edgeStartPointIndex
+            val endpoint = if (position.fraction <= 0.5) startIndex else startIndex + 1
+            val endpointPoint = segment?.points?.getOrNull(endpoint)
+            endpointPoint?.takeIf { GeoMath.distanceMeters(position.point, it) <= 25.0 }
+                ?.let { PointSelection(trackId, position.segmentIndex, endpoint) }
         }
-        val selection = nearest
         _state.update {
-            if (selection == null) it.copy(message = "There are no track points to select.")
-            else if (selection.second > 500.0) it.copy(message = "No track point is within 500 m. Zoom in and tap closer to the route.")
-            else it.copy(
-                selectedTrackId = selection.first.trackId,
-                selectedPoint = selection.first,
-                message = "Selected point ${selection.first.pointIndex + 1} (${formatDistance(selection.second)} away).",
+            it.copy(
+                selectedTrackId = trackId,
+                selectedTrackIds = setOf(trackId),
+                selectedPoint = sourceSelection,
+                selectedCursor = TrackCursor(position, TrackCursorSource.MAP),
+                message = null,
             )
         }
+        refreshCurrentLocationProjection()
+        persistEditorState()
     }
 
     private fun addSplitCut(query: GpxPoint) {
@@ -712,7 +921,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
         updatePoint(selection) { old -> old.copy(latitude = point.latitude, longitude = point.longitude) }
-        _state.update { it.copy(editMode = EditMode.SELECT, message = "Point moved.") }
+        val updated = _state.value.document.tracks.firstOrNull { it.id == selection.trackId }
+        val cursor = updated?.let { TrackPositionEngine.atSourcePoint(it, selection.segmentIndex, selection.pointIndex) }
+        _state.update { it.copy(editMode = EditMode.SELECT, selectedCursor = cursor?.let { value -> TrackCursor(value, TrackCursorSource.RECORDED_POINT) }, message = "Point moved.") }
     }
 
     fun deleteSelectedPoint() {
@@ -724,7 +935,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             if (points.isEmpty()) removeAt(selection.segmentIndex) else this[selection.segmentIndex] = segment.copy(points = points)
         }
         replaceTrack(track.copy(segments = segments), "Point deleted.")
-        _state.update { it.copy(selectedPoint = null) }
+        _state.update { it.copy(selectedPoint = null, selectedCursor = null) }
     }
 
     fun splitSelected() {
@@ -738,7 +949,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         tracks.removeAt(index)
         tracks.addAll(index, listOf(left, right))
         commit(_state.value.document.copy(tracks = tracks), selectedTrackId = right.id, message = "Track split into two tracks.")
-        _state.update { it.copy(selectedPoint = null, editMode = EditMode.SELECT) }
+        _state.update { it.copy(selectedPoint = null, selectedCursor = null, editMode = EditMode.SELECT) }
     }
 
     fun trimBeforeSelected() = trimAtSelection(keepBefore = false)
@@ -755,7 +966,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             listOf(segment.copy(points = points)) + track.segments.drop(selection.segmentIndex + 1)
         }
         replaceTrack(track.copy(segments = segments), if (keepBefore) "Track trimmed after selection." else "Track trimmed before selection.")
-        _state.update { it.copy(selectedPoint = null) }
+        _state.update { it.copy(selectedPoint = null, selectedCursor = null) }
     }
 
     fun reverseSelected(policy: ReverseTimePolicy = ReverseTimePolicy.REASSIGN_MONOTONIC) {
@@ -951,24 +1162,31 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun prepareJoin(strategy: JoinGapStrategy = JoinGapStrategy.PRESERVE_SEGMENT_GAP) {
         val ids = _state.value.selectedTrackIds.ifEmpty { setOfNotNull(_state.value.selectedTrackId) }
         if (ids.size < 2) {
-            _state.update { it.copy(message = "Select at least two tracks to join.") }
+            _state.update { it.copy(message = "Select at least two tracks to merge.") }
             return
         }
         val plan = runCatching { JoinPlanner.plan(_state.value.document.tracks, ids, strategy) }.getOrElse { error ->
-            _state.update { it.copy(message = "Join planning failed: ${error.message}") }
+            _state.update { it.copy(message = "Merge planning failed: ${error.message}") }
             return
         }
+        val mergePoints = _state.value.document.tracks
+            .filter { it.id in ids }
+            .flatMap { it.segments }
+            .flatMap { it.points }
         _state.update {
             it.copy(
                 panel = EditorPanel.MAP,
                 joinDraft = JoinDraft(
                     plan,
-                    name = "${it.selectedTrack?.name ?: "Route"} — joined",
+                    name = "${it.selectedTrack?.name ?: "Route"} — merged",
                     sourceDocumentRevision = project?.documentRevision ?: 0L,
                 ),
+                focusRequest = mergePoints.takeIf { points -> points.isNotEmpty() }
+                    ?.let { points -> MapFocusRequest(focusGeneration.incrementAndGet(), points) },
                 message = "Review the proposed order, directions, and endpoint gaps before applying.",
             )
         }
+        if (strategy == JoinGapStrategy.ROUTED_CONNECTOR) routeJoinConnectors()
     }
 
     fun setJoinStrategy(strategy: JoinGapStrategy) {
@@ -1067,7 +1285,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
         val joined = runCatching {
-            JoinPlanner.assemble(draft.plan, _state.value.document.tracks, draft.name.trim().ifBlank { "Joined route" })
+            JoinPlanner.assemble(draft.plan, _state.value.document.tracks, draft.name.trim().ifBlank { "Merged route" })
         }.getOrElse { error ->
             _state.update { it.copy(message = "Could not assemble joined track: ${error.message}") }
             return
@@ -1083,7 +1301,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         commit(
             _state.value.document.copy(tracks = tracks),
             selectedTrackId = joined.id,
-            message = "Joined ${joinedIds.size} tracks${if (draft.keepOriginals) " and kept the sources" else ""}.",
+            message = "Merged ${joinedIds.size} tracks${if (draft.keepOriginals) " and kept the sources" else ""}.",
         )
         _state.update { it.copy(joinDraft = null, selectionMode = false, selectedTrackIds = setOf(joined.id)) }
     }
@@ -1340,6 +1558,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 selectedTrackIds = setOfNotNull(selectedTrackId),
                 selectionMode = false,
                 selectedPoint = null,
+                selectedCursor = null,
                 undoAvailable = true,
                 redoAvailable = false,
                 dirty = true,
@@ -1349,6 +1568,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 routePlanner = RoutePlannerDraft(),
             )
         }
+        refreshCurrentLocationProjection()
         persistProject(documentChanged = true)
     }
 
@@ -1364,6 +1584,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 selectedTrackIds = setOfNotNull(selected),
                 selectionMode = false,
                 selectedPoint = null,
+                selectedCursor = null,
                 undoAvailable = undo.isNotEmpty(),
                 redoAvailable = redo.isNotEmpty(),
                 dirty = true,
@@ -1373,6 +1594,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 routePlanner = RoutePlannerDraft(),
             )
         }
+        refreshCurrentLocationProjection()
         persistProject(documentChanged = true)
     }
 
@@ -1388,6 +1610,8 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         undo.clear()
         redo.clear()
         val opened = result.project
+        val liveLocation = _state.value.currentLocation
+        val trackingLocation = _state.value.locationTracking
         project = opened
         val session = repository.autosaveSession(opened, viewModelScope)
         autosave = session
@@ -1396,13 +1620,20 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         val selectedIds = editor.selectedTrackIds.filterTo(linkedSetOf()) { id -> document.tracks.any { it.id == id } }
         val selected = editor.selectedTrackId?.takeIf { id -> document.tracks.any { it.id == id } }
             ?: document.tracks.firstOrNull()?.id
+        val restoredSelection = editor.selectedPoint?.let { PointSelection(it.trackId, it.segmentIndex, it.pointIndex) }
+        val restoredCursor = restoredSelection?.let { selection ->
+            document.tracks.firstOrNull { it.id == selection.trackId }
+                ?.let { TrackPositionEngine.atSourcePoint(it, selection.segmentIndex, selection.pointIndex) }
+                ?.let { TrackCursor(it, TrackCursorSource.RECORDED_POINT) }
+        }
         _state.value = EditorUiState(
             document = document,
             styles = stylesFor(document.tracks, editor.styles),
             selectedTrackId = selected,
             selectedTrackIds = selectedIds.ifEmpty { setOfNotNull(selected) },
             selectionMode = selectedIds.size > 1,
-            selectedPoint = editor.selectedPoint?.let { PointSelection(it.trackId, it.segmentIndex, it.pointIndex) },
+            selectedPoint = restoredSelection,
+            selectedCursor = restoredCursor,
             panel = runCatching { EditorPanel.valueOf(editor.panelId) }.getOrDefault(EditorPanel.MAP),
             bicycleProfile = BicycleProfile.entries.firstOrNull { it.id == editor.routingProfileId } ?: BicycleProfile.TOURING,
             dirty = opened.isDocumentDirty,
@@ -1414,7 +1645,12 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             groups = editor.groups,
             camera = editor.camera?.let { MapCameraState(it.latitude, it.longitude, it.zoom, it.bearing, it.pitch) },
             message = result.warnings.firstOrNull(),
+            layersScrollIndex = editor.layersScrollIndex,
+            layersScrollOffset = editor.layersScrollOffset,
+            currentLocation = liveLocation,
+            locationTracking = trackingLocation,
         )
+        refreshCurrentLocationProjection()
         saveStatusJob = viewModelScope.launch {
             session.status.collectLatest { status -> _state.update { it.copy(saveStatus = status) } }
         }
@@ -1471,6 +1707,8 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 camera = state.camera?.let { ProjectCamera(it.latitude, it.longitude, it.zoom, it.bearing, it.tilt) },
                 routingProfileId = state.bicycleProfile.id,
                 panelId = state.panel.name,
+                layersScrollIndex = state.layersScrollIndex,
+                layersScrollOffset = state.layersScrollOffset,
             ),
             documentChanged = documentChanged,
         )
@@ -1491,9 +1729,72 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         return if (atStart xor reversed) points.first() else points.last()
     }
 
+    private fun onDeviceLocation(location: Location) {
+        val current = _state.value.currentLocation
+        if (current != null && location.time < current.recordedAtMillis && location.accuracy >= current.accuracyMeters) return
+        val point = GpxPoint(
+            latitude = location.latitude,
+            longitude = location.longitude,
+            elevation = location.altitude.takeIf { location.hasAltitude() },
+        )
+        _state.update {
+            it.copy(
+                currentLocation = CurrentDeviceLocation(point, location.accuracy, location.time),
+                locationTracking = true,
+            )
+        }
+        refreshCurrentLocationProjection()
+        if (focusWhenLocationArrives) {
+            focusWhenLocationArrives = false
+            focusLocation(point)
+        }
+    }
+
+    private fun focusLocation(point: GpxPoint) {
+        _state.update {
+            it.copy(
+                panel = EditorPanel.MAP,
+                focusRequest = MapFocusRequest(focusGeneration.incrementAndGet(), listOf(point), PROFILE_MAP_INSET_DP),
+            )
+        }
+    }
+
+    private fun refreshCurrentLocationProjection() {
+        val state = _state.value
+        val location = state.currentLocation
+        val track = state.selectedTrack
+        val projection = if (location != null && track != null) {
+            TrackPositionEngine.project(track, location.point)
+                ?.takeIf { it.distanceToTrackMeters <= LOCATION_ROUTE_THRESHOLD_METERS }
+        } else null
+        if (projection != state.currentLocationProjection) {
+            _state.update { it.copy(currentLocationProjection = projection) }
+        }
+    }
+
+    override fun onCleared() {
+        locationTracker.stop()
+    }
+
     private fun queryDisplayName(uri: Uri): String? {
         return getApplication<Application>().contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
             ?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+    }
+
+    private fun importGroupName(document: GpxDocument): String =
+        (document.sourceName ?: document.metadata?.name ?: "Imported GPX")
+            .replace(Regex("(?i)\\.gpx$"), "")
+            .trim()
+
+    private fun uniqueGroupName(requested: String, usedNames: MutableSet<String>): String {
+        val base = requested.ifBlank { "Imported GPX" }
+        var candidate = base
+        var suffix = 2
+        while (!usedNames.add(candidate)) {
+            candidate = "$base ($suffix)"
+            suffix++
+        }
+        return candidate
     }
 
     companion object {
@@ -1505,5 +1806,8 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         private fun stylesFor(tracks: List<GpxTrack>, existing: Map<String, TrackStyle> = emptyMap()): Map<String, TrackStyle> =
             tracks.mapIndexed { index, track -> track.id to (existing[track.id] ?: defaultStyle(index)) }.toMap()
         private fun formatDistance(meters: Double): String = if (meters < 1000) "${meters.toInt()} m" else "%.1f km".format(meters / 1000)
+        private const val LOCATION_ROUTE_THRESHOLD_METERS = 200.0
+        // The map composable already excludes system bars; its center remains above the profile card.
+        private const val PROFILE_MAP_INSET_DP = 0f
     }
 }

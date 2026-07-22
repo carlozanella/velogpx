@@ -37,6 +37,15 @@ class GpxShareRequestTest {
         assertEquals(48.0, selected.document.tracks.single().segments.single().points.single().latitude, 0.0)
     }
 
+    @Test fun multiTrackRequestCreatesOneGarminCompatibleDocument() {
+        val selected = GpxShareRequest.Tracks(fixture(), linkedSetOf("track-b", "track-a")).materialize()
+
+        assertEquals(listOf("track-a", "track-b"), selected.document.tracks.map { it.id })
+        assertTrue(selected.document.routes.isEmpty())
+        assertTrue(selected.document.waypoints.isEmpty())
+        assertEquals("Assembly project.gpx", selected.displayName)
+    }
+
     @Test fun documentRequestPreservesAllGeometryAndForcesGpx11() {
         val source = fixture().copy(version = GpxVersion.V1_0)
         val selected = GpxShareRequest.Document(source).materialize()
@@ -63,6 +72,9 @@ class GpxShareRequestTest {
         }
         assertThrows(IllegalArgumentException::class.java) {
             GpxShareRequest.Segment(fixture(), "track-a", "missing").materialize()
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            GpxShareRequest.Tracks(fixture(), setOf("track-a", "missing")).materialize()
         }
     }
 

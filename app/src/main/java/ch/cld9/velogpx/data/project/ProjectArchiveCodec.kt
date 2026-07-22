@@ -245,6 +245,8 @@ internal object ProjectJson {
         } } ?: JSONObject.NULL)
         put("routingProfileId", editor.routingProfileId)
         put("panelId", editor.panelId)
+        put("layersScrollIndex", editor.layersScrollIndex)
+        put("layersScrollOffset", editor.layersScrollOffset)
     }
 
     private fun decodeEditor(json: JSONObject): ProjectEditorState {
@@ -298,6 +300,8 @@ internal object ProjectJson {
             camera = camera,
             routingProfileId = json.optString("routingProfileId", "trekking"),
             panelId = json.optString("panelId", "MAP"),
+            layersScrollIndex = json.optInt("layersScrollIndex", 0).coerceAtLeast(0),
+            layersScrollOffset = json.optInt("layersScrollOffset", 0).coerceAtLeast(0),
         )
     }
 }

@@ -44,6 +44,7 @@ import kotlin.math.PI
 import kotlin.math.atan
 import kotlin.math.ln
 import kotlin.math.log2
+import kotlin.math.pow
 import kotlin.math.sinh
 import kotlin.math.tan
 
@@ -57,6 +58,15 @@ private const val DRAFT_SOURCE = "velogpx-draft-source"
 private const val DRAFT_LAYER = "velogpx-draft-layer"
 private const val DRAFT_ANCHOR_SOURCE = "velogpx-draft-anchors-source"
 private const val DRAFT_ANCHOR_LAYER = "velogpx-draft-anchors-layer"
+private const val CURSOR_SOURCE = "velogpx-cursor-source"
+private const val CURSOR_HALO_LAYER = "velogpx-cursor-halo-layer"
+private const val CURSOR_LAYER = "velogpx-cursor-layer"
+private const val LOCATION_SOURCE = "velogpx-location-source"
+private const val LOCATION_LAYER = "velogpx-location-layer"
+private const val LOCATION_LINK_SOURCE = "velogpx-location-link-source"
+private const val LOCATION_LINK_LAYER = "velogpx-location-link-layer"
+private const val LOCATION_PROJECTION_SOURCE = "velogpx-location-projection-source"
+private const val LOCATION_PROJECTION_LAYER = "velogpx-location-projection-layer"
 
 data class MapCameraState(
     val latitude: Double,
@@ -66,7 +76,11 @@ data class MapCameraState(
     val tilt: Double = 0.0,
 )
 
-data class MapFocusRequest(val token: Long, val points: List<ModelPoint>)
+data class MapFocusRequest(
+    val token: Long,
+    val points: List<ModelPoint>,
+    val bottomInsetDp: Float = 0f,
+)
 
 data class MapDraftLine(
     val points: List<ModelPoint>,
@@ -79,6 +93,9 @@ private data class MapPayload(
     val styles: Map<String, TrackStyle>,
     val selectedTrackIds: Set<String>,
     val selectedPoint: PointSelection?,
+    val selectedPosition: ModelPoint?,
+    val currentLocation: ModelPoint?,
+    val currentLocationProjection: ModelPoint?,
     val draftLines: List<MapDraftLine>,
     val draftAnchors: List<ModelPoint>,
 )
@@ -91,6 +108,9 @@ fun MapEditor(
     selectedPoint: PointSelection?,
     onMapTap: (Double, Double) -> Unit,
     modifier: Modifier = Modifier,
+    selectedPosition: ModelPoint? = null,
+    currentLocation: ModelPoint? = null,
+    currentLocationProjection: ModelPoint? = null,
     onTracksTap: (List<String>, Double, Double) -> Unit = { _, latitude, longitude -> onMapTap(latitude, longitude) },
     trackPickingEnabled: Boolean = false,
     focusRequest: MapFocusRequest? = null,
@@ -103,8 +123,10 @@ fun MapEditor(
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val mapView = remember { MapView(context).apply { onCreate(Bundle()) } }
     val renderer = remember { MapRenderer() }
-    val latestPayload = remember { AtomicReference(MapPayload(document, styles, selectedTrackIds, selectedPoint, draftLines, draftAnchors)) }
-    latestPayload.set(MapPayload(document, styles, selectedTrackIds, selectedPoint, draftLines, draftAnchors))
+    val latestPayload = remember {
+        AtomicReference(MapPayload(document, styles, selectedTrackIds, selectedPoint, selectedPosition, currentLocation, currentLocationProjection, draftLines, draftAnchors))
+    }
+    latestPayload.set(MapPayload(document, styles, selectedTrackIds, selectedPoint, selectedPosition, currentLocation, currentLocationProjection, draftLines, draftAnchors))
     val latestFocus = remember { AtomicReference(focusRequest) }
     latestFocus.set(focusRequest)
     val latestCameraCallback = remember { AtomicReference(onCameraIdle) }
@@ -197,7 +219,7 @@ fun MapEditor(
         update = { view ->
             view.getMapAsync { map ->
                 map.style?.let { style ->
-                    renderer.sync(map, style, MapPayload(document, styles, selectedTrackIds, selectedPoint, draftLines, draftAnchors))
+                    renderer.sync(map, style, MapPayload(document, styles, selectedTrackIds, selectedPoint, selectedPosition, currentLocation, currentLocationProjection, draftLines, draftAnchors))
                     focusRequest?.let { renderer.focus(map, it, mapView) }
                 }
             }
@@ -214,12 +236,16 @@ private class MapRenderer {
     private var lastFocusToken: Long? = null
     private var lastStyle: Style? = null
     private var lastPayload: MapPayload? = null
+    private var handleTrack: ch.cld9.velogpx.model.GpxTrack? = null
+    private var sampledHandles: List<ModelPoint> = emptyList()
 
     fun sync(map: MapLibreMap, style: Style, payload: MapPayload) {
         val previous = lastPayload
         if (style === lastStyle && previous != null &&
             previous.document === payload.document && previous.styles === payload.styles &&
             previous.selectedTrackIds === payload.selectedTrackIds && previous.selectedPoint === payload.selectedPoint &&
+            previous.selectedPosition === payload.selectedPosition && previous.currentLocation === payload.currentLocation &&
+            previous.currentLocationProjection === payload.currentLocationProjection &&
             previous.draftLines === payload.draftLines && previous.draftAnchors === payload.draftAnchors
         ) return
         lastStyle = style
@@ -285,8 +311,9 @@ private class MapRenderer {
         }
         syncWaypoints(style, payload.document.waypoints)
         val selectedTrack = payload.document.tracks.firstOrNull { it.id == payload.selectedTrackIds.firstOrNull() }
-        syncHandles(style, selectedTrack?.segments?.flatMap { it.points }.orEmpty(), payload.selectedPoint, selectedTrack)
+        syncHandles(style, payload.selectedPoint, selectedTrack)
         syncDraft(style, payload.draftLines, payload.draftAnchors)
+        syncPositionMarkers(style, payload.selectedPosition, payload.currentLocation, payload.currentLocationProjection)
     }
 
     fun applyInitialCamera(map: MapLibreMap, camera: MapCameraState?, document: GpxDocument, mapView: MapView) {
@@ -310,7 +337,7 @@ private class MapRenderer {
     fun focus(map: MapLibreMap, request: MapFocusRequest, mapView: MapView) {
         if (request.token == lastFocusToken) return
         lastFocusToken = request.token
-        fitPoints(map, request.points, animate = true, mapView = mapView)
+        fitPoints(map, request.points, animate = true, mapView = mapView, bottomInsetDp = request.bottomInsetDp)
     }
 
     fun trackIdsAt(map: MapLibreMap, location: LatLng, corridor: Float): List<String> {
@@ -361,18 +388,25 @@ private class MapRenderer {
         ))
     }
 
-    private fun syncHandles(style: Style, points: List<ModelPoint>, selection: PointSelection?, track: ch.cld9.velogpx.model.GpxTrack?) {
-        val stride = (points.size / 500).coerceAtLeast(1)
-        val features = points.mapIndexedNotNull { index, point ->
-            if (index % stride == 0 || selection?.let { selected ->
-                    val actual = track?.segments?.getOrNull(selected.segmentIndex)?.points?.getOrNull(selected.pointIndex)
-                    actual?.id == point.id
-                } == true
-            ) Feature.fromGeometry(Point.fromLngLat(point.longitude, point.latitude)).apply {
-                addBooleanProperty("selected", selection?.let { selected ->
-                    track?.segments?.getOrNull(selected.segmentIndex)?.points?.getOrNull(selected.pointIndex)?.id == point.id
-                } == true)
-            } else null
+    private fun syncHandles(
+        style: Style,
+        selection: PointSelection?,
+        track: ch.cld9.velogpx.model.GpxTrack?,
+    ) {
+        if (track !== handleTrack) {
+            handleTrack = track
+            val points = track?.segments?.flatMap { it.points }.orEmpty()
+            val stride = (points.size / 500).coerceAtLeast(1)
+            sampledHandles = points.filterIndexed { index, _ -> index % stride == 0 }
+        }
+        val selected = selection?.let { value ->
+            track?.segments?.getOrNull(value.segmentIndex)?.points?.getOrNull(value.pointIndex)
+        }
+        val points = if (selected != null && sampledHandles.none { it.id == selected.id }) sampledHandles + selected else sampledHandles
+        val features = points.map { point ->
+            Feature.fromGeometry(Point.fromLngLat(point.longitude, point.latitude)).apply {
+                addBooleanProperty("selected", selected?.id == point.id)
+            }
         }
         val collection = FeatureCollection.fromFeatures(features)
         val source = style.getSourceAs<GeoJsonSource>(HANDLE_SOURCE)
@@ -385,13 +419,76 @@ private class MapRenderer {
         ))
     }
 
-    private fun fitPoints(map: MapLibreMap, points: List<ModelPoint>, animate: Boolean, mapView: MapView) {
+    private fun syncPositionMarkers(
+        style: Style,
+        cursor: ModelPoint?,
+        location: ModelPoint?,
+        projection: ModelPoint?,
+    ) {
+        val cursorCollection = FeatureCollection.fromFeatures(
+            cursor?.let { listOf(Feature.fromGeometry(Point.fromLngLat(it.longitude, it.latitude))) }.orEmpty(),
+        )
+        val cursorSource = style.getSourceAs<GeoJsonSource>(CURSOR_SOURCE)
+        if (cursorSource == null) style.addSource(GeoJsonSource(CURSOR_SOURCE, cursorCollection)) else cursorSource.setGeoJson(cursorCollection)
+        style.removeLayer(CURSOR_HALO_LAYER)
+        style.removeLayer(CURSOR_LAYER)
+        style.addLayer(CircleLayer(CURSOR_HALO_LAYER, CURSOR_SOURCE).withProperties(
+            circleColor("#FFFFFF"), circleRadius(11f), circleStrokeColor("#1B1B1F"), circleStrokeWidth(1.5f),
+        ))
+        style.addLayer(CircleLayer(CURSOR_LAYER, CURSOR_SOURCE).withProperties(
+            circleColor("#C2185B"), circleRadius(6.5f), circleStrokeColor("#FFFFFF"), circleStrokeWidth(1.5f),
+        ))
+
+        val locationCollection = FeatureCollection.fromFeatures(
+            location?.let { listOf(Feature.fromGeometry(Point.fromLngLat(it.longitude, it.latitude))) }.orEmpty(),
+        )
+        val locationSource = style.getSourceAs<GeoJsonSource>(LOCATION_SOURCE)
+        if (locationSource == null) style.addSource(GeoJsonSource(LOCATION_SOURCE, locationCollection)) else locationSource.setGeoJson(locationCollection)
+        style.removeLayer(LOCATION_LAYER)
+        style.addLayer(CircleLayer(LOCATION_LAYER, LOCATION_SOURCE).withProperties(
+            circleColor("#1565C0"), circleRadius(8f), circleStrokeColor("#FFFFFF"), circleStrokeWidth(3f),
+        ))
+
+        val projectionCollection = FeatureCollection.fromFeatures(
+            projection?.let { listOf(Feature.fromGeometry(Point.fromLngLat(it.longitude, it.latitude))) }.orEmpty(),
+        )
+        val projectionSource = style.getSourceAs<GeoJsonSource>(LOCATION_PROJECTION_SOURCE)
+        if (projectionSource == null) style.addSource(GeoJsonSource(LOCATION_PROJECTION_SOURCE, projectionCollection)) else projectionSource.setGeoJson(projectionCollection)
+        style.removeLayer(LOCATION_PROJECTION_LAYER)
+        style.addLayer(CircleLayer(LOCATION_PROJECTION_LAYER, LOCATION_PROJECTION_SOURCE).withProperties(
+            circleColor("#00ACC1"), circleRadius(5f), circleStrokeColor("#FFFFFF"), circleStrokeWidth(2f),
+        ))
+
+        val link = if (location != null && projection != null) {
+            FeatureCollection.fromFeature(
+                Feature.fromGeometry(LineString.fromLngLats(listOf(
+                    Point.fromLngLat(location.longitude, location.latitude),
+                    Point.fromLngLat(projection.longitude, projection.latitude),
+                ))),
+            )
+        } else FeatureCollection.fromFeatures(emptyList())
+        val linkSource = style.getSourceAs<GeoJsonSource>(LOCATION_LINK_SOURCE)
+        if (linkSource == null) style.addSource(GeoJsonSource(LOCATION_LINK_SOURCE, link)) else linkSource.setGeoJson(link)
+        style.removeLayer(LOCATION_LINK_LAYER)
+        style.addLayer(LineLayer(LOCATION_LINK_LAYER, LOCATION_LINK_SOURCE).withProperties(
+            lineColor("#1565C0"), lineWidth(2f), lineOpacity(0.65f),
+        ))
+    }
+
+    private fun fitPoints(
+        map: MapLibreMap,
+        points: List<ModelPoint>,
+        animate: Boolean,
+        mapView: MapView,
+        bottomInsetDp: Float = 0f,
+    ) {
         if (points.isEmpty()) return
         val width = mapView.width.takeIf { it > 0 } ?: mapView.resources.displayMetrics.widthPixels
         val height = mapView.height.takeIf { it > 0 } ?: mapView.resources.displayMetrics.heightPixels
         val padding = 72.0 * mapView.resources.displayMetrics.density
         val usableWidth = (width - 2.0 * padding).coerceAtLeast(64.0)
-        val usableHeight = (height - 2.0 * padding).coerceAtLeast(64.0)
+        val bottomInset = bottomInsetDp * mapView.resources.displayMetrics.density
+        val usableHeight = (height - 2.0 * padding - bottomInset).coerceAtLeast(64.0)
 
         val xs = points.map { point ->
             val raw = (point.longitude + 180.0) / 360.0
@@ -421,7 +518,9 @@ private class MapRenderer {
         val zoomX = if (spanX < 1e-12) 18.0 else log2(usableWidth / (256.0 * spanX))
         val zoomY = if (spanY < 1e-12) 18.0 else log2(usableHeight / (256.0 * spanY))
         val zoom = minOf(zoomX, zoomY).coerceIn(1.0, 18.0)
-        val centerY = (minimumY + maximumY) / 2.0
+        val dataCenterY = (minimumY + maximumY) / 2.0
+        val worldSize = 256.0 * 2.0.pow(zoom)
+        val centerY = (dataCenterY + bottomInset / 2.0 / worldSize).coerceIn(0.0, 1.0)
         val latitude = Math.toDegrees(atan(sinh(PI * (1.0 - 2.0 * centerY))))
         val longitude = centerX * 360.0 - 180.0
         val update = CameraUpdateFactory.newLatLngZoom(LatLng(latitude, longitude), zoom)

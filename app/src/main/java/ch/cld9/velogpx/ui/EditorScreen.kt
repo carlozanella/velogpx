@@ -2,11 +2,12 @@
 
 package ch.cld9.velogpx.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -25,6 +26,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -37,10 +40,12 @@ import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.EditLocationAlt
 import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Polyline
 import androidx.compose.material.icons.filled.QueryStats
 import androidx.compose.material.icons.filled.Save
@@ -77,24 +82,27 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.core.content.ContextCompat
 import ch.cld9.velogpx.data.project.ProjectSaveStatus
 import ch.cld9.velogpx.engine.JoinGapStrategy
 import ch.cld9.velogpx.engine.ReverseTimePolicy
@@ -105,6 +113,9 @@ import ch.cld9.velogpx.routing.BicycleProfile
 import ch.cld9.velogpx.share.GpxShareRequest
 import ch.cld9.velogpx.share.GpxShareService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.Instant
@@ -112,7 +123,7 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlin.math.roundToInt
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, FlowPreview::class)
 @Composable
 fun EditorScreen(viewModel: EditorViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -127,10 +138,13 @@ fun EditorScreen(viewModel: EditorViewModel) {
     var confirmBulkDelete by remember { mutableStateOf(false) }
     var groupDialog by remember { mutableStateOf(false) }
     var shareDialog by remember { mutableStateOf(false) }
+    var mergeDialog by remember { mutableStateOf(false) }
     var exportVersion by remember { mutableStateOf(GpxVersion.V1_1) }
     var exportSelectedOnly by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val layersListState = rememberLazyListState()
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
 
     val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         viewModel.importUris(uris)
@@ -140,6 +154,28 @@ fun EditorScreen(viewModel: EditorViewModel) {
     }
     val zipExporter = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
         uri?.let { viewModel.exportTrackBundle(it, exportVersion) }
+    }
+
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> viewModel.resumeLocationForForeground()
+                Lifecycle.Event.ON_STOP -> viewModel.pauseLocationForBackground()
+                else -> Unit
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(state.projectId) {
+        val maximumLikelyIndex = state.document.tracks.size + state.groups.size +
+            state.document.routes.size + state.document.waypoints.size + 10
+        layersListState.scrollToItem(state.layersScrollIndex.coerceAtMost(maximumLikelyIndex), state.layersScrollOffset)
+        snapshotFlow { layersListState.firstVisibleItemIndex to layersListState.firstVisibleItemScrollOffset }
+            .distinctUntilChanged()
+            .debounce(350)
+            .collect { (index, offset) -> viewModel.rememberLayersScroll(index, offset) }
     }
 
     LaunchedEffect(state.message, state.recoveredAutosave) {
@@ -239,14 +275,22 @@ fun EditorScreen(viewModel: EditorViewModel) {
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
             when (state.panel) {
-                EditorPanel.MAP -> MapPanel(state, viewModel, onTools = { toolsOpen = true })
+                EditorPanel.MAP -> MapPanel(
+                    state,
+                    viewModel,
+                    onTools = { toolsOpen = true },
+                    onMerge = { mergeDialog = true },
+                    onDelete = { confirmBulkDelete = true },
+                )
                 EditorPanel.PROFILE -> ProfilePanel(state, viewModel, onTools = { toolsOpen = true })
                 EditorPanel.LAYERS -> LayersPanel(
                     state,
                     viewModel,
+                    listState = layersListState,
                     onShare = { shareDialog = true },
                     onDelete = { confirmBulkDelete = true },
                     onGroup = { groupDialog = true },
+                    onMerge = { mergeDialog = true },
                 )
             }
             if (state.busy || state.loadingProject) {
@@ -278,7 +322,7 @@ fun EditorScreen(viewModel: EditorViewModel) {
         interpolate = { viewModel.interpolateElevation(); toolsOpen = false },
         time = { toolsOpen = false; timeDialog = true },
         stages = { toolsOpen = false; stagesDialog = true },
-        guidedJoin = { viewModel.prepareJoin(); toolsOpen = false },
+        guidedJoin = { toolsOpen = false; mergeDialog = true },
     )
     if (simplifyDialog) SimplifyDialog(
         dismiss = { simplifyDialog = false },
@@ -308,6 +352,23 @@ fun EditorScreen(viewModel: EditorViewModel) {
         onDelete = viewModel::deleteProject,
         onSnapshot = viewModel::createSnapshot,
     )
+    if (state.importOfferUris.isNotEmpty()) AlertDialog(
+        onDismissRequest = viewModel::dismissImportOffer,
+        title = { Text("Import ${state.importOfferUris.size} GPX file${if (state.importOfferUris.size == 1) "" else "s"}") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Each file becomes a named source group. Exact duplicate tracks, routes, and waypoints are skipped, so reimporting is safe.")
+                Button(onClick = viewModel::confirmImportIntoCurrentProject, modifier = Modifier.fillMaxWidth()) {
+                    Text("Add to current project")
+                }
+                OutlinedButton(onClick = viewModel::confirmImportAsNewProject, modifier = Modifier.fillMaxWidth()) {
+                    Text("Create a new project")
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = viewModel::dismissImportOffer) { Text("Cancel") } },
+    )
     if (confirmBulkDelete) AlertDialog(
         onDismissRequest = { confirmBulkDelete = false },
         title = { Text("Delete selected tracks?") },
@@ -319,6 +380,11 @@ fun EditorScreen(viewModel: EditorViewModel) {
         dismiss = { groupDialog = false },
         apply = { viewModel.createGroup(it); groupDialog = false },
     )
+    if (mergeDialog) MergeMethodDialog(
+        count = state.selectedTrackIds.ifEmpty { setOfNotNull(state.selectedTrackId) }.size,
+        dismiss = { mergeDialog = false },
+        apply = { strategy -> mergeDialog = false; viewModel.prepareJoin(strategy) },
+    )
     if (shareDialog) ShareToGarminDialog(
         state = state,
         dismiss = { shareDialog = false },
@@ -328,7 +394,7 @@ fun EditorScreen(viewModel: EditorViewModel) {
                 runCatching {
                     val service = GpxShareService(context)
                     val prepared = withContext(Dispatchers.IO) { service.prepare(requests) }
-                    context.startActivity(service.createShareIntent(prepared).intent)
+                    context.startActivity(service.createOpenIntent(prepared).intent)
                 }.onFailure { error ->
                     Toast.makeText(context, "Could not share GPX: ${error.message}", Toast.LENGTH_LONG).show()
                 }
@@ -357,7 +423,26 @@ fun EditorScreen(viewModel: EditorViewModel) {
 }
 
 @Composable
-private fun MapPanel(state: EditorUiState, viewModel: EditorViewModel, onTools: () -> Unit) {
+private fun MapPanel(
+    state: EditorUiState,
+    viewModel: EditorViewModel,
+    onTools: () -> Unit,
+    onMerge: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    val context = LocalContext.current
+    val locationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        if (result.values.any { it }) viewModel.startLocationTracking(focusWhenAvailable = true)
+        else viewModel.onLocationPermissionDenied()
+    }
+    val showLocation = {
+        val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            viewModel.startLocationTracking(focusWhenAvailable = true)
+            viewModel.focusCurrentLocation()
+        } else locationPermission.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+    }
     val draftLines = remember(
         state.document,
         state.routePlanner.active,
@@ -373,6 +458,9 @@ private fun MapPanel(state: EditorUiState, viewModel: EditorViewModel, onTools: 
             styles = state.styles,
             selectedTrackIds = state.selectedTrackIds.ifEmpty { setOfNotNull(state.selectedTrackId) },
             selectedPoint = state.selectedPoint,
+            selectedPosition = state.selectedCursor?.position?.point,
+            currentLocation = state.currentLocation?.point,
+            currentLocationProjection = state.currentLocationProjection?.point,
             onMapTap = when {
                 state.routePlanner.active -> viewModel::onRoutePlannerTap
                 state.editMode == EditMode.SPLIT -> { _, _ -> viewModel.onSplitEmptyMapTap() }
@@ -393,18 +481,43 @@ private fun MapPanel(state: EditorUiState, viewModel: EditorViewModel, onTools: 
             if (state.joinDraft == null && state.splitDraft == null) {
                 ModeBar(
                     selected = state.editMode,
+                    selectionMode = state.selectionMode,
                     onSelected = viewModel::setMode,
                     onPlanRoute = viewModel::openRoutePlanner,
+                    onMultiSelect = { if (state.selectionMode) viewModel.exitSelectionMode() else viewModel.enterSelectionMode() },
                     modifier = Modifier.align(Alignment.TopCenter).padding(top = 10.dp),
                 )
-                Column(Modifier.align(Alignment.BottomEnd).padding(16.dp), horizontalAlignment = Alignment.End) {
-                    state.selectedStatistics?.let { stats ->
-                        Surface(shape = RoundedCornerShape(16.dp), tonalElevation = 6.dp) {
-                            Text("${formatDistance(stats.distanceMeters)} · ${stats.pointCount} pts", Modifier.padding(horizontal = 12.dp, vertical = 8.dp), style = MaterialTheme.typography.labelLarge)
+                if (state.selectionMode) {
+                    Surface(
+                        Modifier.align(Alignment.TopCenter).padding(top = 76.dp),
+                        shape = RoundedCornerShape(20.dp),
+                        tonalElevation = 8.dp,
+                    ) {
+                        Row(Modifier.padding(horizontal = 10.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("${state.selectedTrackIds.size} selected", style = MaterialTheme.typography.labelLarge)
+                            TextButton(onClick = onMerge, enabled = state.selectedTrackIds.size >= 2) { Text("Merge") }
+                            TextButton(onClick = onDelete, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Delete") }
+                            TextButton(onClick = viewModel::exitSelectionMode) { Text("Done") }
                         }
-                        Spacer(Modifier.height(8.dp))
                     }
+                }
+                Column(
+                    Modifier.align(Alignment.BottomEnd).padding(16.dp)
+                        .padding(bottom = if (state.selectedTrack != null) 220.dp else 0.dp),
+                    horizontalAlignment = Alignment.End,
+                ) {
+                    FloatingActionButton(onClick = showLocation) { Icon(Icons.Default.MyLocation, "Show current location") }
+                    Spacer(Modifier.height(8.dp))
                     FloatingActionButton(onClick = onTools) { Icon(Icons.Default.AutoFixHigh, "Editing tools") }
+                }
+                state.selectedTrack?.let { track ->
+                    TrackProfileCard(
+                        track = track,
+                        selectedCursor = state.selectedCursor,
+                        currentLocationProjection = state.currentLocationProjection,
+                        onDistanceSelected = viewModel::selectProfileDistance,
+                        modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(10.dp),
+                    )
                 }
             }
         }
@@ -424,10 +537,18 @@ private fun MapPanel(state: EditorUiState, viewModel: EditorViewModel, onTools: 
 }
 
 @Composable
-private fun ModeBar(selected: EditMode, onSelected: (EditMode) -> Unit, onPlanRoute: () -> Unit, modifier: Modifier = Modifier) {
+private fun ModeBar(
+    selected: EditMode,
+    selectionMode: Boolean,
+    onSelected: (EditMode) -> Unit,
+    onPlanRoute: () -> Unit,
+    onMultiSelect: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     Surface(modifier, shape = RoundedCornerShape(24.dp), tonalElevation = 8.dp) {
         LazyRow(Modifier.padding(5.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
             item { ModeButton("Select", Icons.Default.Straighten, selected == EditMode.SELECT) { onSelected(EditMode.SELECT) } }
+            item { ModeButton("Multi", Icons.Default.DoneAll, selectionMode, onMultiSelect) }
             item { ModeButton("Line", Icons.Default.Polyline, selected == EditMode.DRAW_STRAIGHT) { onSelected(EditMode.DRAW_STRAIGHT) } }
             item { ModeButton("Plan", Icons.AutoMirrored.Filled.AltRoute, false, onPlanRoute) }
             item { ModeButton("Move", Icons.Default.EditLocationAlt, selected == EditMode.MOVE) { onSelected(EditMode.MOVE) } }
@@ -547,7 +668,7 @@ private fun JoinPreviewCard(
 ) {
     Surface(modifier.fillMaxWidth(0.86f), shape = RoundedCornerShape(20.dp), tonalElevation = 10.dp) {
         Column(Modifier.padding(14.dp)) {
-            Text("Join preview · ${draft.plan.order.size} tracks", style = MaterialTheme.typography.titleMedium)
+            Text("Merge preview · ${draft.plan.order.size} tracks", style = MaterialTheme.typography.titleMedium)
             Text("Endpoint gaps ${formatDistance(draft.plan.totalGapMeters)} · ${draft.plan.order.count { it.reversed }} reversed", style = MaterialTheme.typography.bodySmall)
             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 items(draft.plan.order) { ref ->
@@ -569,10 +690,18 @@ private fun JoinPreviewCard(
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 TextButton(onClick = viewModel::cancelJoin) { Text("Cancel") }
-                OutlinedButton(onClick = { viewModel.setJoinKeepOriginals(!draft.keepOriginals) }, enabled = !busy) {
-                    Text(if (draft.keepOriginals) "Keep sources ✓" else "Replace sources")
+                Row(
+                    Modifier.clickable(enabled = !busy) { viewModel.setJoinKeepOriginals(!draft.keepOriginals) },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(
+                        checked = draft.keepOriginals,
+                        onCheckedChange = { viewModel.setJoinKeepOriginals(it) },
+                        enabled = !busy,
+                    )
+                    Text("Keep sources", style = MaterialTheme.typography.labelLarge)
                 }
-                Button(onClick = viewModel::applyJoin, enabled = !busy) { Text(if (busy) "Routing…" else "Apply") }
+                Button(onClick = viewModel::applyJoin, enabled = !busy) { Text(if (busy) "Routing…" else "Merge") }
             }
         }
     }
@@ -582,16 +711,18 @@ private fun JoinPreviewCard(
 private fun LayersPanel(
     state: EditorUiState,
     viewModel: EditorViewModel,
+    listState: LazyListState,
     onShare: () -> Unit,
     onDelete: () -> Unit,
     onGroup: () -> Unit,
+    onMerge: () -> Unit,
 ) {
     if (state.document.tracks.isEmpty() && state.document.routes.isEmpty() && state.document.waypoints.isEmpty()) {
         EmptyProject(Modifier.fillMaxSize())
         return
     }
     val collapsedTrackIds = state.groups.filter { it.collapsed }.flatMapTo(mutableSetOf()) { it.layerIds }
-    LazyColumn(Modifier.fillMaxSize()) {
+    LazyColumn(Modifier.fillMaxSize(), state = listState) {
         item {
             Row(Modifier.fillMaxWidth().padding(20.dp, 12.dp, 12.dp, 6.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text("Tracks", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
@@ -611,7 +742,7 @@ private fun LayersPanel(
                             OutlinedButton(onClick = { viewModel.setSelectedTracksVisible(true) }, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Show") }
                             OutlinedButton(onClick = { viewModel.setSelectedTracksVisible(false) }, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Hide") }
                             OutlinedButton(onClick = onGroup, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Group") }
-                            OutlinedButton(onClick = { viewModel.prepareJoin() }, enabled = state.selectedTrackIds.size >= 2) { Text("Join") }
+                            OutlinedButton(onClick = onMerge, enabled = state.selectedTrackIds.size >= 2) { Text("Merge") }
                             OutlinedButton(onClick = onShare, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Garmin") }
                             OutlinedButton(onClick = onDelete, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Delete") }
                         }
@@ -741,7 +872,14 @@ private fun ProfilePanel(state: EditorUiState, viewModel: EditorViewModel, onToo
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
         Text(track.name ?: "Track profile", style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(14.dp))
-        ElevationChart(track.segments, Modifier.fillMaxWidth().height(220.dp))
+        TrackProfileCard(
+            track = track,
+            selectedCursor = state.selectedCursor,
+            currentLocationProjection = state.currentLocationProjection,
+            onDistanceSelected = viewModel::selectProfileDistance,
+            modifier = Modifier.fillMaxWidth(),
+            expanded = true,
+        )
         Spacer(Modifier.height(18.dp))
         StatsGrid(stats)
         Spacer(Modifier.height(18.dp))
@@ -757,51 +895,6 @@ private fun ProfilePanel(state: EditorUiState, viewModel: EditorViewModel, onToo
         }
         Spacer(Modifier.height(18.dp))
         Button(onClick = onTools, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.AutoFixHigh, null); Spacer(Modifier.width(8.dp)); Text("Open editing tools") }
-    }
-}
-
-@Composable
-private fun ElevationChart(segments: List<ch.cld9.velogpx.model.GpxTrackSegment>, modifier: Modifier = Modifier) {
-    data class Sample(val distance: Double, val elevation: Double)
-    val runs = remember(segments) {
-        buildList<List<Sample>> {
-            var cumulative = 0.0
-            segments.forEach { segment ->
-                var run = mutableListOf<Sample>()
-                segment.points.forEachIndexed { index, point ->
-                    if (index > 0) cumulative += ch.cld9.velogpx.engine.GeoMath.distanceMeters(segment.points[index - 1], point)
-                    if (point.elevation == null) {
-                        if (run.isNotEmpty()) add(run)
-                        run = mutableListOf()
-                    } else run += Sample(cumulative, point.elevation)
-                }
-                if (run.isNotEmpty()) add(run)
-            }
-        }
-    }
-    val samples = runs.flatten()
-    val elevations = samples.map { it.elevation }
-    Surface(modifier, shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)) {
-        if (elevations.size < 2) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No elevation profile in this track") }
-            return@Surface
-        }
-        val minimum = elevations.min()
-        val maximum = elevations.max()
-        val range = (maximum - minimum).coerceAtLeast(1.0)
-        val line = MaterialTheme.colorScheme.primary
-        Canvas(Modifier.fillMaxSize().padding(16.dp)) {
-            val totalDistance = samples.maxOf { it.distance }.coerceAtLeast(1.0)
-            runs.filter { it.size >= 2 }.forEach { run ->
-                val path = Path()
-                run.forEachIndexed { index, sample ->
-                    val x = (sample.distance / totalDistance).toFloat() * size.width
-                    val y = size.height - ((sample.elevation - minimum) / range).toFloat() * size.height
-                    if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
-                }
-                drawPath(path, color = line, style = androidx.compose.ui.graphics.drawscope.Stroke(4.dp.toPx(), cap = StrokeCap.Round))
-            }
-        }
     }
 }
 
@@ -867,7 +960,7 @@ private fun TransformSheet(
             ToolRow("Plan daily stages", "Split into complete day tracks by target distance", stages, state.selectedTrack != null)
             if (state.selectedTrackIds.size > 1) {
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
-                ToolRow("Join selected tracks", "Preview order, orientation, every gap, and whether sources are retained", guidedJoin, true)
+                ToolRow("Merge selected tracks", "Choose direct, separated, or bicycle-routed connections and review before applying", guidedJoin, true)
             }
         }
     }
@@ -947,6 +1040,39 @@ private fun GroupDialog(dismiss: () -> Unit, apply: (String) -> Unit) {
 }
 
 @Composable
+private fun MergeMethodDialog(count: Int, dismiss: () -> Unit, apply: (JoinGapStrategy) -> Unit) {
+    AlertDialog(
+        onDismissRequest = dismiss,
+        title = { Text("Merge $count tracks") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("VeloGPX will first optimize track order and direction. You can review all endpoint gaps before applying.")
+                OutlinedButton(
+                    onClick = { apply(JoinGapStrategy.PRESERVE_SEGMENT_GAP) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column { Text("Preserve gaps"); Text("One track with separate GPX segments", style = MaterialTheme.typography.bodySmall) }
+                }
+                OutlinedButton(
+                    onClick = { apply(JoinGapStrategy.STRAIGHT_CONNECTOR) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column { Text("Connect directly"); Text("Draw straight lines across every gap", style = MaterialTheme.typography.bodySmall) }
+                }
+                Button(
+                    onClick = { apply(JoinGapStrategy.ROUTED_CONNECTOR) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column { Text("Plan bicycle connections"); Text("Use BRouter to fill the gaps", style = MaterialTheme.typography.bodySmall) }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = dismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
 private fun ShareToGarminDialog(
     state: EditorUiState,
     dismiss: () -> Unit,
@@ -959,7 +1085,7 @@ private fun ShareToGarminDialog(
         title = { Text("Send to Garmin Connect") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
-                Text("Android will open Garmin Connect when it accepts GPX sharing, otherwise you can choose it from the system share sheet.")
+                Text("VeloGPX opens a real .gpx file. This is the Android contract Garmin Connect supports; choose Connect if Android asks which app to use.")
                 Spacer(Modifier.height(12.dp))
                 OutlinedButton(
                     onClick = { share(listOf(GpxShareRequest.Document(state.document))) },
@@ -968,7 +1094,12 @@ private fun ShareToGarminDialog(
                 ) { Text("Send whole project") }
                 Spacer(Modifier.height(8.dp))
                 Button(
-                    onClick = { share(tracks.map { GpxShareRequest.Track(state.document, it.id) }) },
+                    onClick = {
+                        share(
+                            if (tracks.size == 1) listOf(GpxShareRequest.Track(state.document, tracks.single().id))
+                            else listOf(GpxShareRequest.Tracks(state.document, tracks.mapTo(linkedSetOf()) { it.id }))
+                        )
+                    },
                     enabled = tracks.isNotEmpty(),
                     modifier = Modifier.fillMaxWidth(),
                 ) { Text(if (tracks.size > 1) "Send ${tracks.size} selected tracks" else "Send track") }

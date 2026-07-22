@@ -19,6 +19,13 @@ sealed interface GpxShareRequest {
         override val suggestedFileName: String? = null,
     ) : GpxShareRequest
 
+    /** Several tracks materialized as one GPX file, required by Android's open-file contract. */
+    data class Tracks(
+        override val document: GpxDocument,
+        val trackIds: Set<String>,
+        override val suggestedFileName: String? = null,
+    ) : GpxShareRequest
+
     data class Segment(
         override val document: GpxDocument,
         val trackId: String,
@@ -49,6 +56,22 @@ internal fun GpxShareRequest.materialize(): MaterializedGpx = when (this) {
             waypoints = emptyList(),
             routes = emptyList(),
             tracks = listOf(track),
+            sourceName = null,
+        )
+        MaterializedGpx(selected, sanitizeGpxFileName(name))
+    }
+
+    is GpxShareRequest.Tracks -> {
+        val selectedTracks = document.tracks.filter { it.id in trackIds }
+        require(selectedTracks.isNotEmpty()) { "None of the requested tracks are part of the document" }
+        require(selectedTracks.size == trackIds.size) { "At least one requested track is missing" }
+        val name = suggestedFileName ?: document.metadata?.name ?: "Selected routes"
+        val selected = document.copy(
+            version = GpxVersion.V1_1,
+            metadata = document.metadata?.copy(name = name.removeGpxSuffix()),
+            waypoints = emptyList(),
+            routes = emptyList(),
+            tracks = selectedTracks,
             sourceName = null,
         )
         MaterializedGpx(selected, sanitizeGpxFileName(name))

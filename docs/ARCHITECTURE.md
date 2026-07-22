@@ -19,12 +19,16 @@ EditorViewModel ─── undo/redo snapshots ─── ProjectRepository
         │                                  └── rotating recovery snapshots
         │
         ├── GPX codec (1.0/1.1 + structured extension XML)
-        ├── edit engine (range/split/join/trim/reverse/clean/time/elevation/stages)
+        ├── edit engine (range/split/merge/trim/reverse/clean/time/elevation/stages)
+        ├── track-position engine (distance profile/cursor/location projection)
+        ├── import identity engine (source grouping + exact geometry deduplication)
         ├── analysis engine (geodesic distance/elevation/time/speed)
         └── RoutingProvider ─── BRouter HTTP implementation
 ```
 
-The source `GpxDocument` remains the interchange truth. Tracks retain segment boundaries, routes remain routes until an explicit conversion, and waypoints remain independent. Presentation state is stored beside GPX in the project archive: stable IDs, order, styles, groups, multi-selection, camera, panel, and routing profile never leak into exported GPX.
+The source `GpxDocument` remains the interchange truth. Tracks retain segment boundaries, routes remain routes until an explicit conversion, and waypoints remain independent. Presentation state is stored beside GPX in the project archive: stable IDs, order, styles, source groups, multi-selection, layer scroll, camera, panel, and routing profile never leak into exported GPX.
+
+`TrackPositionEngine` is the single definition of a continuous position along a multi-segment track. The map cursor, interactive elevation profile, point details, and foreground device-location projection all consume that model. Distances continue across segment boundaries without inventing distance across their gaps. A position can identify an exact recorded point or an interpolated fraction of an edge.
 
 Every geometry edit creates a new immutable document revision, adds the prior revision to bounded history, clears redo after divergence, and submits a versioned project state. Autosave is debounced at 750 ms with a five-second maximum delay and is flushed when the app backgrounds. The `.velogpx` ZIP contains a checksummed GPX document and versioned manifest; writes use `AtomicFile`, snapshots rotate by age/size/count, and corrupt current archives recover from a verified snapshot.
 
@@ -32,9 +36,11 @@ Unknown extension nodes retain namespace URI, local name, prefix hint, ordered a
 
 ## Map and network policy
 
-MapLibre renders per-track GeoJSON sources; only sampled edit handles are displayed for large tracks while full geometry remains in the model/export. OpenFreeMap avoids an SDK key and explicitly supports public use. VeloGPX never bulk-downloads the OpenStreetMap standard tile service.
+MapLibre renders per-track GeoJSON sources; only cached sampled edit handles are displayed for large tracks while full geometry remains in the model/export. Elevation drawing is peak-preserving and bounded to 3,000 chart samples, while cursor calculations retain full precision. OpenFreeMap avoids an SDK key and explicitly supports public use. VeloGPX never bulk-downloads the OpenStreetMap standard tile service.
 
-All editing functions are local. `RoutingProvider` is replaceable: v1.1 uses BRouter's public HTTPS endpoint only after the dedicated planner receives explicit start/end anchors and the user requests alternatives. Requests/results are typed, cancellable, size-limited, and revision/token/profile-bound. A bundled/offline BRouter provider can be added without changing the editor engine. No helo backend is deployed.
+All editing functions are local. `RoutingProvider` is replaceable: VeloGPX uses BRouter's public HTTPS endpoint only after the dedicated planner receives explicit start/end anchors or the user chooses planned merge connections. Requests/results are typed, cancellable, size-limited, and revision/token/profile-bound. A bundled/offline BRouter provider can be added without changing the editor engine. No helo backend is deployed.
+
+Location is foreground-only and opt-in. Android's `LocationManager` supplies the current coordinate after runtime permission; VeloGPX stops updates when the app leaves the foreground and never persists the coordinate. Nearest-route projection is local and appears on the profile only within 200 m.
 
 ## Safety
 
@@ -42,6 +48,7 @@ All editing functions are local. `RoutingProvider` is replaceable: v1.1 uses BRo
 - Finite WGS84 coordinate validation; invalid values are rejected rather than clamped.
 - Segment gaps are excluded from statistics unless an explicit stitch creates an edge.
 - Split duplicates its boundary point; repeated cuts and span extraction resolve stable segment/edge/point IDs transactionally before emitting output.
-- Join planning preserves source payload, uses exact or deterministic endpoint ordering, keeps gaps by default, and attaches routed connectors to exact source endpoints.
-- Route, join, and split drafts validate their source document revision before Apply and each becomes a single undo step.
+- Merge planning preserves source payload, uses exact or deterministic endpoint ordering, replaces sources by default with an explicit keep-sources option, and attaches routed connectors to exact source endpoints.
+- Route, merge, and split drafts validate their source document revision before Apply and each becomes a single undo step.
+- Garmin handoff materializes one permission-granted `.gpx` content URI and uses `ACTION_VIEW`, matching Garmin Connect's advertised Android contract.
 - Source files are never overwritten and internal autosave uses temporary-file replacement.

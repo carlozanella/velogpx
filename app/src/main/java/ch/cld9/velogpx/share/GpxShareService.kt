@@ -127,6 +127,35 @@ class GpxShareService internal constructor(
         )
     }
 
+    /**
+     * Opens a single GPX as a document. Garmin Connect registers this ACTION_VIEW contract but,
+     * on current Android releases, does not advertise itself for ACTION_SEND.
+     */
+    fun createOpenIntent(
+        prepared: PreparedGpxShare,
+        preferGarminConnect: Boolean = true,
+        chooserTitle: CharSequence = context.getString(R.string.share_gpx_chooser_title),
+    ): GpxShareLaunch {
+        require(prepared.files.size == 1) { "Opening a GPX requires exactly one file" }
+        val file = prepared.files.single()
+        val standard = buildOpenIntent(file, GPX_MIME_TYPE)
+        if (preferGarminConnect) {
+            listOf(GPX_MIME_TYPE, COMPATIBILITY_MIME_TYPE).forEach { mimeType ->
+                val direct = buildOpenIntent(file, mimeType).setPackage(GARMIN_CONNECT_PACKAGE)
+                if (activityResolver.canResolve(direct)) {
+                    return GpxShareLaunch(direct, GpxShareDestination.GARMIN_CONNECT)
+                }
+            }
+        }
+        return GpxShareLaunch(
+            Intent.createChooser(standard, chooserTitle).apply {
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                clipData = standard.clipData
+            },
+            GpxShareDestination.SYSTEM_CHOOSER,
+        )
+    }
+
     /** Removes a prepared session after a cancelled share. Do not call while a receiver may still read it. */
     fun discard(prepared: PreparedGpxShare): Boolean {
         val session = prepared.sessionDirectory.canonicalFile
@@ -165,6 +194,13 @@ class GpxShareService internal constructor(
         }
         return intent
     }
+
+    private fun buildOpenIntent(file: PreparedGpxFile, mimeType: String): Intent =
+        Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(file.uri, mimeType)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            clipData = ClipData.newUri(context.contentResolver, file.displayName, file.uri)
+        }
 
     private fun uniqueName(requested: String, usedNames: MutableSet<String>): String {
         val base = requested.removeSuffix(".gpx")

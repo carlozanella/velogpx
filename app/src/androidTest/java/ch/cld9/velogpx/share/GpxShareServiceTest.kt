@@ -95,6 +95,33 @@ class GpxShareServiceTest {
         assertFalse(launch.intent.action == Intent.ACTION_CHOOSER)
     }
 
+    @Test fun garminOpenUsesViewContractWithContentUriAndReadGrant() {
+        val service = service(resolves = true)
+        val prepared = trackPrepared(service)
+        val launch = service.createOpenIntent(prepared)
+
+        assertEquals(GpxShareDestination.GARMIN_CONNECT, launch.destination)
+        assertEquals(Intent.ACTION_VIEW, launch.intent.action)
+        assertEquals(GPX_MIME_TYPE, launch.intent.type)
+        assertEquals(prepared.files.single().uri, launch.intent.data)
+        assertEquals(GpxShareService.GARMIN_CONNECT_PACKAGE, launch.intent.`package`)
+        assertTrue(launch.intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0)
+        assertEquals(prepared.files.single().uri, launch.intent.clipData!!.getItemAt(0).uri)
+    }
+
+    @Test fun unresolvedGarminOpenFallsBackToViewChooserNotShareSheet() {
+        val service = service(resolves = false)
+        val prepared = trackPrepared(service)
+        val launch = service.createOpenIntent(prepared)
+        val target = chooserTarget(launch.intent)
+
+        assertEquals(GpxShareDestination.SYSTEM_CHOOSER, launch.destination)
+        assertEquals(Intent.ACTION_CHOOSER, launch.intent.action)
+        assertEquals(Intent.ACTION_VIEW, target.action)
+        assertEquals(prepared.files.single().uri, target.data)
+        assertEquals(GPX_MIME_TYPE, target.type)
+    }
+
     @Test fun segmentExportWritesOnlyTheRequestedSegment() {
         val service = service(resolves = false)
         val document = fixture()

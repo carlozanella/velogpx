@@ -26,6 +26,14 @@ The baseline reviewed was [gpx.studio](https://gpx.studio/help/toolbar): multi-f
 7. WGS84 geodesic statistics, segment-gap-safe distance, elevation profile, and daily-stage generation.
 8. Android Storage Access Framework/share-intent integration plus Garmin Connect project/track/segment sharing, without broad storage permission or a backend.
 
+## V1.2 route-use essentials
+
+The 1.2 design pass used GPX Viewer-style route awareness as its reference: a selected track remains spatially and numerically understandable while editing. It adds a shared continuous-position model, always-visible interactive distance/elevation profile, strongly marked cursor, recorded-point versus between-point identity, coordinates/elevation/time/distance details, and a foreground location projection with a conservative 200 m route threshold.
+
+Track management is now symmetric between map and Layers: both offer multi-select, and Merge is a named first-class workflow with replace-by-default semantics plus preserved-gap, direct, and bicycle-routed connectors. Imports receive an explicit current/new-project decision, one source group per file, and exact duplicate suppression for tracks, routes, and waypoints. Layer scroll and focus behavior are project state, and large-file chart/handle rendering has bounded presentation work without reducing editing or export precision.
+
+Garmin Connect was verified to advertise Android's open-document (`ACTION_VIEW`) contract for GPX files rather than the generic `ACTION_SEND` contract. VeloGPX 1.2 therefore materializes one real `.gpx` file and opens it with permission grants, matching the successful behavior of opening a GPX from Android's Files app.
+
 ## Longer-term depth
 
 The architecture deliberately leaves clean provider boundaries for bundled BRouter `.rd5` regions, imported local PMTiles, DEM elevation lookup, OSM surface/access auditing, selected-span road matching, overlap removal, alternative comparison, stage optimization around overnight POIs, KML/TCX/FIT, and cue sheets. Those require substantial map datasets or additional format engines and are not disguised as backend-dependent features.

@@ -47,6 +47,8 @@ class ProjectArchiveCodecTest {
                 camera = ProjectCamera(47.1, 8.2, 10.5, 15.0, 25.0),
                 routingProfileId = "gravel",
                 panelId = "LAYERS",
+                layersScrollIndex = 17,
+                layersScrollOffset = 43,
             ),
             revision = 12,
             documentRevision = 8,

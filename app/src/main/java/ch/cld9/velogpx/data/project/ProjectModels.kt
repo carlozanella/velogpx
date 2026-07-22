@@ -45,6 +45,8 @@ data class ProjectEditorState(
     val camera: ProjectCamera? = null,
     val routingProfileId: String = "trekking",
     val panelId: String = "MAP",
+    val layersScrollIndex: Int = 0,
+    val layersScrollOffset: Int = 0,
 )
 
 data class ProjectState(
