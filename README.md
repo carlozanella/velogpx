@@ -6,7 +6,7 @@ VeloGPX is a local-first Android GPX editor built for assembling long bicycle to
 
 - Imports several GPX 1.0/1.1 files through Android's file picker, share sheet, or “Open with”.
 - Preserves tracks, track segments, routes, waypoints, metadata, timestamps, elevation, legacy course/speed, and namespace-aware extension XML.
-- Overlays every track in a color-coded layer list with exact map focus, direct line picking, map and list multi-selection, bulk show/hide/delete/share/merge, source groups, and collapsible groups.
+- Overlays every track in a color-coded layer list with exact map focus, direct line picking, long-press and freehand-lasso multi-selection, combined selection profiles/totals, bulk show/hide/delete/share/merge, source groups, and collapsible groups.
 - Provides an explicit BRouter planner for start, end, and via anchors; touring, road, gravel, low-traffic, and shortest profiles; up to four preview alternatives; and safe new/append/prepend application.
 - Selects, moves, deletes, trims, repeatedly splits, and extracts spans directly from the map with transactional previews.
 - Guides merging selected tracks through an optimized order/orientation preview, preserve-gap/direct/BRouter connector policies, exact connector endpoints, and keep-or-replace source choice.
@@ -22,7 +22,7 @@ No account, analytics SDK, broad storage permission, or VeloGPX backend is used.
 
 ## Install
 
-Download `VeloGPX-1.2.0.apk` from the latest GitHub Release and allow installation from your browser/files app. The release APK is signed with a development key for direct personal installation.
+Download `VeloGPX-1.2.1.apk` from the latest GitHub Release and allow installation from your browser/files app. The release APK is signed with a development key for direct personal installation.
 
 Android 8.0 (API 26) or newer is supported. The app targets Android 17/API 37.
 

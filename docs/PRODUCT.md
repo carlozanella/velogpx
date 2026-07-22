@@ -32,6 +32,8 @@ The 1.2 design pass used GPX Viewer-style route awareness as its reference: a se
 
 Track management is now symmetric between map and Layers: both offer multi-select, and Merge is a named first-class workflow with replace-by-default semantics plus preserved-gap, direct, and bicycle-routed connectors. Imports receive an explicit current/new-project decision, one source group per file, and exact duplicate suppression for tracks, routes, and waypoints. Layer scroll and focus behavior are project state, and large-file chart/handle rendering has bounded presentation work without reducing editing or export precision.
 
+The 1.2.1 interaction pass adds conventional empty-space deselection and long-press selection, plus a one-shot freehand map lasso for spatially selecting many visible tracks. Multi-selection is represented by a combined distance/elevation profile in the exact optimized order and orientation proposed by Merge; source distance, endpoint gaps, connectors, and output distance remain explicitly separate.
+
 Garmin Connect was verified to advertise Android's open-document (`ACTION_VIEW`) contract for GPX files rather than the generic `ACTION_SEND` contract. VeloGPX 1.2 therefore materializes one real `.gpx` file and opens it with permission grants, matching the successful behavior of opening a GPX from Android's Files app.
 
 ## Longer-term depth

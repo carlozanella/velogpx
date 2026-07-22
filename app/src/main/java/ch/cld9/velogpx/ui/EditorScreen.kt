@@ -1,4 +1,7 @@
-@file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@file:OptIn(
+    androidx.compose.foundation.layout.ExperimentalLayoutApi::class,
+    androidx.compose.foundation.ExperimentalFoundationApi::class,
+)
 
 package ch.cld9.velogpx.ui
 
@@ -10,6 +13,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -107,7 +111,10 @@ import ch.cld9.velogpx.data.project.ProjectSaveStatus
 import ch.cld9.velogpx.engine.JoinGapStrategy
 import ch.cld9.velogpx.engine.ReverseTimePolicy
 import ch.cld9.velogpx.engine.TrackStatistics
+import ch.cld9.velogpx.engine.TrackSelectionProfile
+import ch.cld9.velogpx.engine.TrackSelectionProfileEngine
 import ch.cld9.velogpx.model.GpxPoint
+import ch.cld9.velogpx.model.GpxTrack
 import ch.cld9.velogpx.model.GpxVersion
 import ch.cld9.velogpx.routing.BicycleProfile
 import ch.cld9.velogpx.share.GpxShareRequest
@@ -127,6 +134,11 @@ import kotlin.math.roundToInt
 @Composable
 fun EditorScreen(viewModel: EditorViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val selectionProfile = remember(state.document.tracks, state.selectedTrackIds, state.selectionMode) {
+        if (state.selectionMode && state.selectedTrackIds.size >= 2) {
+            runCatching { TrackSelectionProfileEngine.build(state.document.tracks, state.selectedTrackIds) }.getOrNull()
+        } else null
+    }
     val snackbarHost = remember { SnackbarHostState() }
     var menuOpen by remember { mutableStateOf(false) }
     var toolsOpen by remember { mutableStateOf(false) }
@@ -278,14 +290,16 @@ fun EditorScreen(viewModel: EditorViewModel) {
                 EditorPanel.MAP -> MapPanel(
                     state,
                     viewModel,
+                    selectionProfile,
                     onTools = { toolsOpen = true },
                     onMerge = { mergeDialog = true },
                     onDelete = { confirmBulkDelete = true },
                 )
-                EditorPanel.PROFILE -> ProfilePanel(state, viewModel, onTools = { toolsOpen = true })
+                EditorPanel.PROFILE -> ProfilePanel(state, viewModel, selectionProfile, onTools = { toolsOpen = true })
                 EditorPanel.LAYERS -> LayersPanel(
                     state,
                     viewModel,
+                    selectionProfile,
                     listState = layersListState,
                     onShare = { shareDialog = true },
                     onDelete = { confirmBulkDelete = true },
@@ -382,6 +396,10 @@ fun EditorScreen(viewModel: EditorViewModel) {
     )
     if (mergeDialog) MergeMethodDialog(
         count = state.selectedTrackIds.ifEmpty { setOfNotNull(state.selectedTrackId) }.size,
+        routeDistanceMeters = selectionProfile?.totalDistanceMeters
+            ?: state.selectedTrack?.let { ch.cld9.velogpx.engine.GpxAnalytics.statistics(it).distanceMeters }
+            ?: 0.0,
+        endpointGapMeters = selectionProfile?.plan?.totalGapMeters ?: 0.0,
         dismiss = { mergeDialog = false },
         apply = { strategy -> mergeDialog = false; viewModel.prepareJoin(strategy) },
     )
@@ -426,6 +444,7 @@ fun EditorScreen(viewModel: EditorViewModel) {
 private fun MapPanel(
     state: EditorUiState,
     viewModel: EditorViewModel,
+    selectionProfile: TrackSelectionProfile?,
     onTools: () -> Unit,
     onMerge: () -> Unit,
     onDelete: () -> Unit,
@@ -467,7 +486,9 @@ private fun MapPanel(
                 else -> viewModel::onMapTap
             },
             onTracksTap = viewModel::onMapTracksTap,
-            trackPickingEnabled = !state.routePlanner.active && state.editMode in setOf(EditMode.SELECT, EditMode.SPLIT),
+            trackPickingEnabled = !state.routePlanner.active && !state.lassoSelectionActive && state.editMode in setOf(EditMode.SELECT, EditMode.SPLIT),
+            lassoSelectionEnabled = state.lassoSelectionActive,
+            onLassoSelection = viewModel::selectTracksByLasso,
             focusRequest = state.focusRequest,
             initialCamera = state.camera,
             onCameraIdle = viewModel::onCameraIdle,
@@ -493,30 +514,43 @@ private fun MapPanel(
                         shape = RoundedCornerShape(20.dp),
                         tonalElevation = 8.dp,
                     ) {
-                        Row(Modifier.padding(horizontal = 10.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Text("${state.selectedTrackIds.size} selected", style = MaterialTheme.typography.labelLarge)
-                            TextButton(onClick = onMerge, enabled = state.selectedTrackIds.size >= 2) { Text("Merge") }
-                            TextButton(onClick = onDelete, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Delete") }
-                            TextButton(onClick = viewModel::exitSelectionMode) { Text("Done") }
+                        Column(Modifier.padding(horizontal = 10.dp, vertical = 5.dp)) {
+                            Text(
+                                "${state.selectedTrackIds.size} selected" + selectionProfile?.let { " · ${formatDistance(it.totalDistanceMeters)}" }.orEmpty(),
+                                style = MaterialTheme.typography.labelLarge,
+                            )
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                                TextButton(onClick = viewModel::toggleLassoSelection) { Text(if (state.lassoSelectionActive) "Cancel lasso" else "Lasso") }
+                                TextButton(onClick = onMerge, enabled = state.selectedTrackIds.size >= 2) { Text("Merge") }
+                                TextButton(onClick = onDelete, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Delete") }
+                                TextButton(onClick = viewModel::exitSelectionMode) { Text("Done") }
+                            }
+                            if (state.lassoSelectionActive) {
+                                Text("Draw a closed shape around visible tracks", style = MaterialTheme.typography.bodySmall)
+                            }
                         }
                     }
                 }
+                val profileTrack = selectionProfile?.previewTrack ?: state.selectedTrack
                 Column(
                     Modifier.align(Alignment.BottomEnd).padding(16.dp)
-                        .padding(bottom = if (state.selectedTrack != null) 220.dp else 0.dp),
+                        .padding(bottom = if (profileTrack != null) 220.dp else 0.dp),
                     horizontalAlignment = Alignment.End,
                 ) {
                     FloatingActionButton(onClick = showLocation) { Icon(Icons.Default.MyLocation, "Show current location") }
                     Spacer(Modifier.height(8.dp))
                     FloatingActionButton(onClick = onTools) { Icon(Icons.Default.AutoFixHigh, "Editing tools") }
                 }
-                state.selectedTrack?.let { track ->
+                profileTrack?.let { track ->
                     TrackProfileCard(
                         track = track,
                         selectedCursor = state.selectedCursor,
                         currentLocationProjection = state.currentLocationProjection,
                         onDistanceSelected = viewModel::selectProfileDistance,
                         modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(10.dp),
+                        profileTitle = selectionProfile?.let { "${it.sections.size} tracks · optimized merge order" },
+                        positionDistanceMeters = selectionProfile?.let { profile -> profile::displayDistance },
+                        positionTrackName = selectionProfile?.let { profile -> profile::sourceTrackName },
                     )
                 }
             }
@@ -527,7 +561,7 @@ private fun MapPanel(
         state.joinDraft?.let { draft ->
             JoinPreviewCard(
                 draft,
-                state.document.tracks.associate { it.id to (it.name ?: "Unnamed") },
+                state.document.tracks.associateBy { it.id },
                 state.busy,
                 viewModel,
                 Modifier.align(Alignment.BottomStart).padding(16.dp),
@@ -661,19 +695,43 @@ private fun SplitPreviewCard(cutCount: Int, viewModel: EditorViewModel, modifier
 @Composable
 private fun JoinPreviewCard(
     draft: JoinDraft,
-    trackNames: Map<String, String>,
+    tracks: Map<String, GpxTrack>,
     busy: Boolean,
     viewModel: EditorViewModel,
     modifier: Modifier = Modifier,
 ) {
+    val sourceDistance = draft.plan.order.sumOf { reference ->
+        tracks[reference.trackId]?.let { ch.cld9.velogpx.engine.GpxAnalytics.statistics(it).distanceMeters } ?: 0.0
+    }
+    val pendingConnections = draft.plan.edges.any {
+        it.strategy == JoinGapStrategy.ROUTED_CONNECTOR && it.routedConnector == null
+    }
+    val connectionDistance = draft.plan.edges.sumOf { edge ->
+        when (edge.strategy) {
+            JoinGapStrategy.PRESERVE_SEGMENT_GAP -> 0.0
+            JoinGapStrategy.STRAIGHT_CONNECTOR -> edge.gapMeters
+            JoinGapStrategy.ROUTED_CONNECTOR -> edge.routedConnector?.let { segment ->
+                ch.cld9.velogpx.engine.GpxAnalytics.statistics(GpxTrack(segments = listOf(segment))).distanceMeters
+            } ?: 0.0
+        }
+    }
     Surface(modifier.fillMaxWidth(0.86f), shape = RoundedCornerShape(20.dp), tonalElevation = 10.dp) {
         Column(Modifier.padding(14.dp)) {
             Text("Merge preview · ${draft.plan.order.size} tracks", style = MaterialTheme.typography.titleMedium)
             Text("Endpoint gaps ${formatDistance(draft.plan.totalGapMeters)} · ${draft.plan.order.count { it.reversed }} reversed", style = MaterialTheme.typography.bodySmall)
+            Text(
+                if (pendingConnections) {
+                    "Routes ${formatDistance(sourceDistance)} · routing connections…"
+                } else {
+                    "Routes ${formatDistance(sourceDistance)} + connections ${formatDistance(connectionDistance)} = ${formatDistance(sourceDistance + connectionDistance)}"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.SemiBold,
+            )
             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 items(draft.plan.order) { ref ->
                     val name = draft.plan.order.indexOf(ref) + 1
-                    AssistChip(onClick = {}, label = { Text("$name. ${if (ref.reversed) "↶ " else ""}${trackNames[ref.trackId]}") })
+                    AssistChip(onClick = {}, label = { Text("$name. ${if (ref.reversed) "↶ " else ""}${tracks[ref.trackId]?.name ?: "Unnamed"}") })
                 }
             }
             OutlinedTextField(
@@ -711,6 +769,7 @@ private fun JoinPreviewCard(
 private fun LayersPanel(
     state: EditorUiState,
     viewModel: EditorViewModel,
+    selectionProfile: TrackSelectionProfile?,
     listState: LazyListState,
     onShare: () -> Unit,
     onDelete: () -> Unit,
@@ -736,7 +795,10 @@ private fun LayersPanel(
             item {
                 Surface(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp), shape = RoundedCornerShape(18.dp), tonalElevation = 3.dp) {
                     Column(Modifier.padding(10.dp)) {
-                        Text("${state.selectedTrackIds.size} selected", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "${state.selectedTrackIds.size} selected" + selectionProfile?.let { " · ${formatDistance(it.totalDistanceMeters)} total" }.orEmpty(),
+                            style = MaterialTheme.typography.titleMedium,
+                        )
                         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             OutlinedButton(onClick = viewModel::focusSelectedTracks, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Show on map") }
                             OutlinedButton(onClick = { viewModel.setSelectedTracksVisible(true) }, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Show") }
@@ -785,9 +847,13 @@ private fun LayersPanel(
                         }
                     }
                 },
-                modifier = Modifier.clickable {
-                    if (state.selectionMode) viewModel.toggleTrackSelection(track.id) else viewModel.selectTrack(track.id)
-                }
+                modifier = Modifier.combinedClickable(
+                    onClick = {
+                        if (state.selectionMode) viewModel.toggleTrackSelection(track.id) else viewModel.selectTrack(track.id)
+                    },
+                    onLongClick = { viewModel.enterSelectionMode(track.id) },
+                    onLongClickLabel = "Start selecting tracks",
+                )
                     .background(if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f) else Color.Transparent),
             )
             if (selected && !state.selectionMode) {
@@ -860,15 +926,20 @@ private fun EmptyProject(modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun ProfilePanel(state: EditorUiState, viewModel: EditorViewModel, onTools: () -> Unit) {
-    val track = state.selectedTrack
+private fun ProfilePanel(
+    state: EditorUiState,
+    viewModel: EditorViewModel,
+    selectionProfile: TrackSelectionProfile?,
+    onTools: () -> Unit,
+) {
+    val track = selectionProfile?.previewTrack ?: state.selectedTrack
     if (track == null) {
         Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
             Text("Select a track to inspect its profile.")
         }
         return
     }
-    val stats = state.selectedStatistics!!
+    val stats = ch.cld9.velogpx.engine.GpxAnalytics.statistics(track)
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
         Text(track.name ?: "Track profile", style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(14.dp))
@@ -879,6 +950,9 @@ private fun ProfilePanel(state: EditorUiState, viewModel: EditorViewModel, onToo
             onDistanceSelected = viewModel::selectProfileDistance,
             modifier = Modifier.fillMaxWidth(),
             expanded = true,
+            profileTitle = selectionProfile?.let { "${it.sections.size} tracks · optimized merge order" },
+            positionDistanceMeters = selectionProfile?.let { profile -> profile::displayDistance },
+            positionTrackName = selectionProfile?.let { profile -> profile::sourceTrackName },
         )
         Spacer(Modifier.height(18.dp))
         StatsGrid(stats)
@@ -894,7 +968,11 @@ private fun ProfilePanel(state: EditorUiState, viewModel: EditorViewModel, onToo
             }
         }
         Spacer(Modifier.height(18.dp))
-        Button(onClick = onTools, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.AutoFixHigh, null); Spacer(Modifier.width(8.dp)); Text("Open editing tools") }
+        if (selectionProfile == null) {
+            Button(onClick = onTools, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.AutoFixHigh, null); Spacer(Modifier.width(8.dp)); Text("Open editing tools") }
+        } else {
+            Text("Connections are excluded until you choose a Merge method.", style = MaterialTheme.typography.bodyMedium)
+        }
     }
 }
 
@@ -1040,13 +1118,24 @@ private fun GroupDialog(dismiss: () -> Unit, apply: (String) -> Unit) {
 }
 
 @Composable
-private fun MergeMethodDialog(count: Int, dismiss: () -> Unit, apply: (JoinGapStrategy) -> Unit) {
+private fun MergeMethodDialog(
+    count: Int,
+    routeDistanceMeters: Double,
+    endpointGapMeters: Double,
+    dismiss: () -> Unit,
+    apply: (JoinGapStrategy) -> Unit,
+) {
     AlertDialog(
         onDismissRequest = dismiss,
         title = { Text("Merge $count tracks") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("VeloGPX will first optimize track order and direction. You can review all endpoint gaps before applying.")
+                Text(
+                    "Selected routes ${formatDistance(routeDistanceMeters)} · optimized endpoint gaps ${formatDistance(endpointGapMeters)}. Connections are added only if you choose them.",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
                 OutlinedButton(
                     onClick = { apply(JoinGapStrategy.PRESERVE_SEGMENT_GAP) },
                     modifier = Modifier.fillMaxWidth(),

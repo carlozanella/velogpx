@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.1 — 2026-07-22
+
+- Tapping empty map space in Select mode now clears the selected tracks, point cursor, profile, and route-location projection.
+- Empty-map deselection stays inside Multi mode so another set can be built immediately, and the deselected state is autosaved and restored.
+- Long-pressing a track in Layers now starts multi-selection, and the map adds a one-shot freehand lasso that selects every visible track inside or crossing the drawn shape.
+- Multi-selection now shows total route length and one combined interactive elevation profile in Merge's optimized order and direction.
+- Merge dialogs now distinguish source-route length, endpoint gaps, connector length, and final output length.
+
 ## 1.2.0 — 2026-07-22
 
 - Added an always-available interactive distance/elevation profile for the selected track, exact tap cursors, source-point/edge identity, coordinates, elevation, time, and distance from route start.
