@@ -22,7 +22,7 @@ No account, analytics SDK, broad storage permission, or VeloGPX backend is used.
 
 ## Install
 
-Download `VeloGPX-1.2.2.apk` from the latest GitHub Release and allow installation from your browser/files app. The release APK is signed with a development key for direct personal installation.
+Download `VeloGPX-1.2.3.apk` from the latest GitHub Release and allow installation from your browser/files app. The release APK is signed with a development key for direct personal installation.
 
 Android 8.0 (API 26) or newer is supported. The app targets Android 17/API 37.
 
@@ -45,13 +45,13 @@ The release build intentionally uses the standard Android debug signing key for 
 ## Using the editor
 
 1. Tap the folder icon, choose one or several GPX files, then add them to this project or create a new one. Each file becomes a source group and exact reimports are skipped.
-2. Use **Layers** to focus a route, or tap **Multi** on the map / **Select** in Layers for bulk actions, grouping, merging, or Garmin handoff.
+2. Use **Tracks** to find and focus a route, or tap **Multi** on the map / **Select** in Tracks for bulk actions, grouping, merging, or Garmin handoff. Opening Tracks automatically reveals the primary map selection.
 3. On **Map**, use Select, Line, Move, Split, or POI. Tap **Plan** for the dedicated route planner; it never chooses a hidden starting point.
 4. For merging, select two or more tracks, choose preserved gaps, direct lines, or bicycle-planned connections, then preview order, direction, output name, and source retention.
 5. In Split mode, tap the rendered track, add one or several cut markers, then split once or extract the span between exactly two markers.
 6. Open the wand button for cleaning, timestamp/elevation tools, daily-stage planning, and other transforms.
 7. Tap anywhere on the bottom profile for an exact route cursor. The location button shows your position and, when nearby, its corresponding profile position.
-8. Undo/redo as needed, then export or open **Garmin** from Layers.
+8. Undo/redo as needed, then export or open **Garmin** from Tracks.
 
 Important semantics:
 

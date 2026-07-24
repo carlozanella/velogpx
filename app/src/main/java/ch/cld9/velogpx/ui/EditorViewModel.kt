@@ -102,6 +102,8 @@ data class MapTrackChoice(
     val forSplit: Boolean,
 )
 
+data class TrackListFocusRequest(val generation: Long, val trackId: String)
+
 data class PointSelection(
     val trackId: String,
     val segmentIndex: Int,
@@ -147,6 +149,7 @@ data class EditorUiState(
     val groups: List<ProjectLayerGroup> = emptyList(),
     val camera: MapCameraState? = null,
     val focusRequest: MapFocusRequest? = null,
+    val trackListFocusRequest: TrackListFocusRequest? = null,
     val splitDraft: SplitDraft? = null,
     val joinDraft: JoinDraft? = null,
     val routePlanner: RoutePlannerDraft = RoutePlannerDraft(),
@@ -265,11 +268,11 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun setPanel(panel: EditorPanel) {
-        _state.update { it.copy(panel = panel, lassoSelectionActive = it.lassoSelectionActive && panel == EditorPanel.MAP) }
+        _state.update { state -> TracksListLayout.enterPanel(state, panel, focusGeneration::incrementAndGet) }
         persistEditorState()
     }
 
-    fun rememberLayersScroll(index: Int, offset: Int) {
+    fun rememberTracksScroll(index: Int, offset: Int) {
         val safeIndex = index.coerceAtLeast(0)
         val safeOffset = offset.coerceAtLeast(0)
         if (_state.value.layersScrollIndex == safeIndex && _state.value.layersScrollOffset == safeOffset) return
@@ -293,7 +296,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         persistEditorState()
     }
 
-    /** Layer-list selection deliberately focuses; map selection deliberately does not. */
+    /** Track-list selection deliberately focuses the map; map selection deliberately does not. */
     fun selectTrack(id: String) = selectTrack(id, focus = true)
 
     fun selectTracksFromMap(ids: List<String>) {

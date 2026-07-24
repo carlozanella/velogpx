@@ -107,6 +107,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.core.content.ContextCompat
+import ch.cld9.velogpx.data.project.ProjectLayerGroup
 import ch.cld9.velogpx.data.project.ProjectSaveStatus
 import ch.cld9.velogpx.engine.JoinGapStrategy
 import ch.cld9.velogpx.engine.ReverseTimePolicy
@@ -155,7 +156,7 @@ fun EditorScreen(viewModel: EditorViewModel) {
     var exportSelectedOnly by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val layersListState = rememberLazyListState()
+    val tracksListState = rememberLazyListState()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
 
     val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
@@ -183,12 +184,20 @@ fun EditorScreen(viewModel: EditorViewModel) {
     LaunchedEffect(state.projectId) {
         val maximumLikelyIndex = state.document.tracks.size + state.groups.size +
             state.document.routes.size + state.document.waypoints.size + 10
-        layersListState.scrollToItem(state.layersScrollIndex.coerceAtMost(maximumLikelyIndex), state.layersScrollOffset)
-        snapshotFlow { layersListState.firstVisibleItemIndex to layersListState.firstVisibleItemScrollOffset }
+        tracksListState.scrollToItem(state.layersScrollIndex.coerceAtMost(maximumLikelyIndex), state.layersScrollOffset)
+        snapshotFlow { tracksListState.firstVisibleItemIndex to tracksListState.firstVisibleItemScrollOffset }
             .distinctUntilChanged()
             .debounce(350)
-            .collect { (index, offset) -> viewModel.rememberLayersScroll(index, offset) }
+            .collect { (index, offset) -> viewModel.rememberTracksScroll(index, offset) }
     }
+
+    TracksListRevealEffect(
+        request = state.trackListFocusRequest,
+        tracks = state.document.tracks,
+        groups = state.groups,
+        selectionMode = state.selectionMode,
+        listState = tracksListState,
+    )
 
     LaunchedEffect(state.message, state.recoveredAutosave) {
         when {
@@ -279,7 +288,7 @@ fun EditorScreen(viewModel: EditorViewModel) {
                 NavigationBarItem(
                     selected = state.panel == EditorPanel.LAYERS,
                     onClick = { viewModel.setPanel(EditorPanel.LAYERS) },
-                    icon = { Icon(Icons.Default.Layers, null) }, label = { Text("Layers") },
+                    icon = { Icon(Icons.Default.Polyline, null) }, label = { Text("Tracks") },
                 )
             }
         },
@@ -296,11 +305,11 @@ fun EditorScreen(viewModel: EditorViewModel) {
                     onDelete = { confirmBulkDelete = true },
                 )
                 EditorPanel.PROFILE -> ProfilePanel(state, viewModel, selectionProfile, onTools = { toolsOpen = true })
-                EditorPanel.LAYERS -> LayersPanel(
+                EditorPanel.LAYERS -> TracksPanel(
                     state,
                     viewModel,
                     selectionProfile,
-                    listState = layersListState,
+                    listState = tracksListState,
                     onShare = { shareDialog = true },
                     onDelete = { confirmBulkDelete = true },
                     onGroup = { groupDialog = true },
@@ -766,7 +775,7 @@ private fun JoinPreviewCard(
 }
 
 @Composable
-private fun LayersPanel(
+private fun TracksPanel(
     state: EditorUiState,
     viewModel: EditorViewModel,
     selectionProfile: TrackSelectionProfile?,
@@ -780,7 +789,6 @@ private fun LayersPanel(
         EmptyProject(Modifier.fillMaxSize())
         return
     }
-    val collapsedTrackIds = state.groups.filter { it.collapsed }.flatMapTo(mutableSetOf()) { it.layerIds }
     LazyColumn(Modifier.fillMaxSize(), state = listState) {
         item {
             Row(Modifier.fillMaxWidth().padding(20.dp, 12.dp, 12.dp, 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -825,7 +833,7 @@ private fun LayersPanel(
             }
             item { HorizontalDivider() }
         }
-        items(state.document.tracks.filterNot { it.id in collapsedTrackIds }, key = { it.id }) { track ->
+        items(TracksListLayout.visibleTracks(state.document.tracks, state.groups), key = { it.id }) { track ->
             val selected = track.id in state.selectedTrackIds || (!state.selectionMode && track.id == state.selectedTrackId)
             val style = state.styles[track.id]
             val group = state.groups.firstOrNull { track.id in it.layerIds }
@@ -911,6 +919,22 @@ private fun LayersPanel(
             }
         }
         item { Spacer(Modifier.height(32.dp)) }
+    }
+}
+
+@Composable
+internal fun TracksListRevealEffect(
+    request: TrackListFocusRequest?,
+    tracks: List<GpxTrack>,
+    groups: List<ProjectLayerGroup>,
+    selectionMode: Boolean,
+    listState: LazyListState,
+) {
+    LaunchedEffect(request?.generation) {
+        request ?: return@LaunchedEffect
+        val itemIndex = TracksListLayout.itemIndex(tracks, groups, selectionMode, request.trackId)
+            ?: return@LaunchedEffect
+        listState.animateScrollToItem(itemIndex)
     }
 }
 

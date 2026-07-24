@@ -16,7 +16,7 @@ The host test suite covers:
 - Exact import geometry identity, repeated-batch suppression, direction and segment-boundary distinction, and persisted layer-scroll state.
 - Combined-selection profiles, merge-order/orientation mapping, excluded endpoint gaps, and freehand-lasso containment/intersection geometry.
 
-The v1.2.2 release gate runs 85 host tests and 11 Android-runtime tests. Runtime coverage verifies the freehand lasso gesture overlay, Android XML security, readable GPX 1.1 single-course materialization without multi-segment point loss, URI grants, send and open-file chooser fallbacks, and Garmin Connect `ACTION_VIEW` targeting.
+The v1.2.3 release gate runs 88 host tests and 12 Android-runtime tests. Host coverage includes exact Tracks-list row indexing, collapsed-group reveal behavior, and one-shot panel-entry focus requests. Runtime coverage verifies that a deep selected-track row is actually scrolled into the visible Compose viewport, plus the freehand lasso gesture overlay, Android XML security, readable GPX 1.1 single-course materialization without multi-segment point loss, URI grants, send and open-file chooser fallbacks, and Garmin Connect `ACTION_VIEW` targeting.
 
 Run all automated checks with:
 
@@ -36,6 +36,6 @@ The emulator smoke procedure uses an Android 17/API 37.1 16-KB-page x86_64 image
 8. Grant foreground location, inject an emulator fix near and far from the route, and verify the 200 m profile projection threshold.
 9. Exercise layer/profile navigation, import source grouping/deduplication, Garmin open-file instrumentation, and confirm no fatal process logs.
 10. Select one or several tracks, tap empty map space, and verify the highlight/profile/cursor clear while Multi mode remains active when applicable.
-11. Long-press a Layers row to enter Multi, lasso several visible tracks on the map, and verify the combined profile/total follows the same order and directions as Merge.
+11. Select a track on the map, open Tracks, and verify its row is revealed and scrolled into view; long-press a Tracks row to enter Multi, lasso several visible tracks, and verify the combined profile/total follows the same order and directions as Merge.
 
-The v1.2.2 release gate covers 96 tests, Android lint, debug/release APK assembly, API 37 installation/version verification, selection persistence, import grouping, interactive profile/point detail, lasso and long-press multi-select, merge preview, and Garmin single-course/open-file validation. This repository's GitHub Actions workflow repeats unit tests, lint, and APK assembly on each push.
+The v1.2.3 release gate covers 100 tests, Android lint, debug/release APK assembly, API 37 installation/version verification, selected-track reveal in Tracks, selection persistence, import grouping, interactive profile/point detail, lasso and long-press multi-select, merge preview, and Garmin single-course/open-file validation. This repository's GitHub Actions workflow repeats unit tests, lint, and APK assembly on each push.

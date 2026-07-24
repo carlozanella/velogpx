@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.3 — 2026-07-24
+
+- Renamed the user-facing Layers tab to Tracks, matching the route objects managed there.
+- Opening Tracks from Map or Profile now scrolls the primary selected track into view.
+- A collapsed group containing the selected track is expanded automatically; without a selection, the remembered list position remains unchanged.
+
 ## 1.2.2 — 2026-07-24
 
 - Fixed Garmin Connect silently importing only the first segment of a multi-segment track.
