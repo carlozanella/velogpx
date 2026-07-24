@@ -41,9 +41,30 @@ class GpxShareServiceTest {
         assertTrue(parsed.issues.toString(), parsed.isSuccess)
         assertEquals("1.1", parsed.document!!.version.value)
         assertEquals(listOf("Selected route"), parsed.document.tracks.map { it.name })
-        assertEquals(2, parsed.document.tracks.single().segments.size)
+        assertEquals(1, parsed.document.tracks.single().segments.size)
+        assertEquals(
+            listOf(47.0, 48.0),
+            parsed.document.tracks.single().segments.single().points.map { it.latitude },
+        )
         assertTrue(parsed.document.routes.isEmpty())
         assertTrue(parsed.document.waypoints.isEmpty())
+    }
+
+    @Test fun wholeProjectFileSerializesEveryPathIntoOneGarminCourse() {
+        val service = service(resolves = false)
+        val document = fixture()
+        val prepared = remember(service, service.prepare(GpxShareRequest.Document(document)))
+
+        val parsed = prepared.files.single().cacheFile.inputStream().use { GpxParser().parse(it).document!! }
+        assertEquals(1, parsed.tracks.size)
+        assertEquals(1, parsed.tracks.single().segments.size)
+        assertEquals(
+            listOf(47.0, 48.0, 49.0, 46.5),
+            parsed.tracks.single().segments.single().points.map { it.latitude },
+        )
+        assertEquals(1, parsed.waypoints.size)
+        assertTrue(parsed.routes.isEmpty())
+        assertEquals(document.pointCount, parsed.pointCount)
     }
 
     @Test fun chooserIntentGrantsOneUriAndCarriesGpxMimeType() {

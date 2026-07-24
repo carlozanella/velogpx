@@ -1177,13 +1177,13 @@ private fun ShareToGarminDialog(
         title = { Text("Send to Garmin Connect") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
-                Text("VeloGPX opens a real .gpx file. This is the Android contract Garmin Connect supports; choose Connect if Android asks which app to use.")
+                Text("Garmin Connect imports one continuous course per GPX. VeloGPX includes every requested track and segment in that course, in the order shown; separate segments are joined by straight course edges.")
                 Spacer(Modifier.height(12.dp))
                 OutlinedButton(
                     onClick = { share(listOf(GpxShareRequest.Document(state.document))) },
                     enabled = !state.document.isEmpty,
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("Send whole project") }
+                ) { Text("Send whole project as one course") }
                 Spacer(Modifier.height(8.dp))
                 Button(
                     onClick = {
@@ -1194,7 +1194,14 @@ private fun ShareToGarminDialog(
                     },
                     enabled = tracks.isNotEmpty(),
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text(if (tracks.size > 1) "Send ${tracks.size} selected tracks" else "Send track") }
+                ) {
+                    Text(
+                        if (tracks.size > 1) "Send ${tracks.size} selected tracks as one course"
+                        else tracks.singleOrNull()?.segments?.size?.takeIf { it > 1 }
+                            ?.let { "Send track · all $it segments" }
+                            ?: "Send track",
+                    )
+                }
                 if (tracks.size == 1 && tracks.single().segments.size > 1) {
                     Spacer(Modifier.height(12.dp))
                     Text("Or send one segment", style = MaterialTheme.typography.titleSmall)

@@ -14,7 +14,7 @@ VeloGPX is a local-first Android GPX editor built for assembling long bicycle to
 - Splits a master route into exact, consecutively numbered daily stages by target distance.
 - Shows WGS84 distance, ascent/descent, time, speed, point counts, and an interactive distance/elevation profile on the map with exact point/edge details.
 - Shows current location on request and projects it onto the selected route/profile only when it is within 200 m.
-- Exports the whole project, only the selected track, or a ZIP containing one GPX per track/day, and opens projects/tracks/segments as real GPX documents in Garmin Connect.
+- Exports the whole project, only the selected track, or a ZIP containing one GPX per track/day, and opens projects/tracks/segments as real GPX documents in Garmin Connect. Garmin handoffs use one continuous course so Connect retains every requested segment.
 - Stores multiple named projects as checksummed atomic `.velogpx` archives, restores the last project/camera/layers/groups/selection, autosaves every change, rotates recovery snapshots, and provides 75-step undo/redo.
 - Uses OpenFreeMap/MapLibre without an API key. GPX editing and export work without a backend.
 
@@ -22,7 +22,7 @@ No account, analytics SDK, broad storage permission, or VeloGPX backend is used.
 
 ## Install
 
-Download `VeloGPX-1.2.1.apk` from the latest GitHub Release and allow installation from your browser/files app. The release APK is signed with a development key for direct personal installation.
+Download `VeloGPX-1.2.2.apk` from the latest GitHub Release and allow installation from your browser/files app. The release APK is signed with a development key for direct personal installation.
 
 Android 8.0 (API 26) or newer is supported. The app targets Android 17/API 37.
 

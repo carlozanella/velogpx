@@ -36,6 +36,8 @@ The 1.2.1 interaction pass adds conventional empty-space deselection and long-pr
 
 Garmin Connect was verified to advertise Android's open-document (`ACTION_VIEW`) contract for GPX files rather than the generic `ACTION_SEND` contract. VeloGPX 1.2 therefore materializes one real `.gpx` file and opens it with permission grants, matching the successful behavior of opening a GPX from Android's Files app.
 
+The 1.2.2 compatibility pass also accounts for Connect's single-course import behavior: track, multi-track, and project handoffs contain one GPX track segment with every requested path point. This prevents later segments from being silently omitted; because Garmin's course model is continuous, boundaries between source segments appear as straight edges.
+
 ## Longer-term depth
 
 The architecture deliberately leaves clean provider boundaries for bundled BRouter `.rd5` regions, imported local PMTiles, DEM elevation lookup, OSM surface/access auditing, selected-span road matching, overlap removal, alternative comparison, stage optimization around overnight POIs, KML/TCX/FIT, and cue sheets. Those require substantial map datasets or additional format engines and are not disguised as backend-dependent features.

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.2 — 2026-07-24
+
+- Fixed Garmin Connect silently importing only the first segment of a multi-segment track.
+- Garmin handoff now serializes the whole requested track, selection, or project as one track with one continuous segment, retaining every path point.
+- Clarified in the Garmin dialog that Connect's single-course model joins segment boundaries with straight course edges.
+
 ## 1.2.1 — 2026-07-22
 
 - Tapping empty map space in Select mode now clears the selected tracks, point cursor, profile, and route-location projection.

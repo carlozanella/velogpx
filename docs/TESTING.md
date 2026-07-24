@@ -16,7 +16,7 @@ The host test suite covers:
 - Exact import geometry identity, repeated-batch suppression, direction and segment-boundary distinction, and persisted layer-scroll state.
 - Combined-selection profiles, merge-order/orientation mapping, excluded endpoint gaps, and freehand-lasso containment/intersection geometry.
 
-The v1.2.1 release gate runs 85 host tests and 10 Android-runtime tests. Runtime coverage verifies the freehand lasso gesture overlay, Android XML security, readable GPX 1.1 track/segment materialization, URI grants, send and open-file chooser fallbacks, and Garmin Connect `ACTION_VIEW` targeting.
+The v1.2.2 release gate runs 85 host tests and 11 Android-runtime tests. Runtime coverage verifies the freehand lasso gesture overlay, Android XML security, readable GPX 1.1 single-course materialization without multi-segment point loss, URI grants, send and open-file chooser fallbacks, and Garmin Connect `ACTION_VIEW` targeting.
 
 Run all automated checks with:
 
@@ -38,4 +38,4 @@ The emulator smoke procedure uses an Android 17/API 37.1 16-KB-page x86_64 image
 10. Select one or several tracks, tap empty map space, and verify the highlight/profile/cursor clear while Multi mode remains active when applicable.
 11. Long-press a Layers row to enter Multi, lasso several visible tracks on the map, and verify the combined profile/total follows the same order and directions as Merge.
 
-The v1.2.1 release gate covers 95 tests, Android lint, debug/release APK assembly, API 37 installation/version verification, selection persistence, import grouping, interactive profile/point detail, lasso and long-press multi-select, merge preview, and Garmin open-file validation. This repository's GitHub Actions workflow repeats unit tests, lint, and APK assembly on each push.
+The v1.2.2 release gate covers 96 tests, Android lint, debug/release APK assembly, API 37 installation/version verification, selection persistence, import grouping, interactive profile/point detail, lasso and long-press multi-select, merge preview, and Garmin single-course/open-file validation. This repository's GitHub Actions workflow repeats unit tests, lint, and APK assembly on each push.

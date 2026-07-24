@@ -52,5 +52,5 @@ Location is foreground-only and opt-in. Android's `LocationManager` supplies the
 - Split duplicates its boundary point; repeated cuts and span extraction resolve stable segment/edge/point IDs transactionally before emitting output.
 - Merge planning preserves source payload, uses exact or deterministic endpoint ordering, replaces sources by default with an explicit keep-sources option, and attaches routed connectors to exact source endpoints.
 - Route, merge, and split drafts validate their source document revision before Apply and each becomes a single undo step.
-- Garmin handoff materializes one permission-granted `.gpx` content URI and uses `ACTION_VIEW`, matching Garmin Connect's advertised Android contract.
+- Garmin handoff materializes one permission-granted `.gpx` content URI and uses `ACTION_VIEW`, matching Garmin Connect's advertised Android contract. Since Connect imports one continuous course and may ignore later GPX tracks/segments, the handoff document flattens every requested path run into exactly one track segment without dropping points.
 - Source files are never overwritten and internal autosave uses temporary-file replacement.

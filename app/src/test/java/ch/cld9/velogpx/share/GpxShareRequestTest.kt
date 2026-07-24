@@ -14,16 +14,21 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class GpxShareRequestTest {
-    @Test fun trackRequestContainsOnlyTheSelectedTrackGeometry() {
+    @Test fun trackRequestContainsEverySegmentInOneGarminCourse() {
         val source = fixture()
-        val selected = GpxShareRequest.Track(source, "track-b").materialize()
+        val selected = GpxShareRequest.Track(source, "track-a").materialize()
 
         assertEquals(GpxVersion.V1_1, selected.document.version)
-        assertEquals(listOf("track-b"), selected.document.tracks.map { it.id })
+        assertEquals(1, selected.document.tracks.size)
+        assertEquals(1, selected.document.tracks.single().segments.size)
+        assertEquals(
+            listOf(47.0, 48.0),
+            selected.document.tracks.single().segments.single().points.map { it.latitude },
+        )
         assertTrue(selected.document.routes.isEmpty())
         assertTrue(selected.document.waypoints.isEmpty())
-        assertEquals("Alpine option", selected.document.metadata?.name)
-        assertEquals("Alpine option.gpx", selected.displayName)
+        assertEquals("EuroVelo 5", selected.document.metadata?.name)
+        assertEquals("EuroVelo 5.gpx", selected.displayName)
     }
 
     @Test fun segmentRequestContainsExactlyOneSelectedSegment() {
@@ -40,20 +45,31 @@ class GpxShareRequestTest {
     @Test fun multiTrackRequestCreatesOneGarminCompatibleDocument() {
         val selected = GpxShareRequest.Tracks(fixture(), linkedSetOf("track-b", "track-a")).materialize()
 
-        assertEquals(listOf("track-a", "track-b"), selected.document.tracks.map { it.id })
+        assertEquals(1, selected.document.tracks.size)
+        assertEquals(1, selected.document.tracks.single().segments.size)
+        assertEquals(
+            listOf(47.0, 48.0, 49.0),
+            selected.document.tracks.single().segments.single().points.map { it.latitude },
+        )
         assertTrue(selected.document.routes.isEmpty())
         assertTrue(selected.document.waypoints.isEmpty())
         assertEquals("Assembly project.gpx", selected.displayName)
     }
 
-    @Test fun documentRequestPreservesAllGeometryAndForcesGpx11() {
+    @Test fun documentRequestPutsEveryPathPointInOneCourseAndPreservesWaypoints() {
         val source = fixture().copy(version = GpxVersion.V1_0)
         val selected = GpxShareRequest.Document(source).materialize()
 
         assertEquals(GpxVersion.V1_1, selected.document.version)
-        assertEquals(source.tracks.size, selected.document.tracks.size)
-        assertEquals(source.routes.size, selected.document.routes.size)
+        assertEquals(1, selected.document.tracks.size)
+        assertEquals(1, selected.document.tracks.single().segments.size)
+        assertEquals(
+            listOf(47.0, 48.0, 49.0, 46.5),
+            selected.document.tracks.single().segments.single().points.map { it.latitude },
+        )
+        assertTrue(selected.document.routes.isEmpty())
         assertEquals(source.waypoints.size, selected.document.waypoints.size)
+        assertEquals(source.pointCount, selected.document.pointCount)
     }
 
     @Test fun fileNameSanitizationRemovesPathsControlsAndDuplicateSuffix() {
