@@ -3,6 +3,7 @@
 ## 1.3.1 — 2026-07-26
 
 - Fixed selected-track handles, cursor, and location projection continuing to reveal a track after its group was hidden.
+- Moved whole-group selection profile and merge-order analysis off the UI thread so selecting large imported groups no longer freezes the app.
 - Made CI release signing stable and added a certificate-continuity release gate so future APKs remain installable as updates.
 
 ## 1.3.0 — 2026-07-26

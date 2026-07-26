@@ -90,6 +90,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.rememberCoroutineScope
@@ -135,10 +136,18 @@ import kotlin.math.roundToInt
 @Composable
 fun EditorScreen(viewModel: EditorViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    val selectionProfile = remember(state.document.tracks, state.selectedTrackIds, state.selectionMode) {
+    val selectionProfile by produceState<TrackSelectionProfile?>(
+        null,
+        state.document.tracks,
+        state.selectedTrackIds,
+        state.selectionMode,
+    ) {
+        value = null
         if (state.selectionMode && state.selectedTrackIds.size >= 2) {
-            runCatching { TrackSelectionProfileEngine.build(state.document.tracks, state.selectedTrackIds) }.getOrNull()
-        } else null
+            value = withContext(Dispatchers.Default) {
+                runCatching { TrackSelectionProfileEngine.build(state.document.tracks, state.selectedTrackIds) }.getOrNull()
+            }
+        }
     }
     val snackbarHost = remember { SnackbarHostState() }
     var menuOpen by remember { mutableStateOf(false) }
