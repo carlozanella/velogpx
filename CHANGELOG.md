@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0 — 2026-07-26
+
+- Made groups real track-list containers: every track belongs to exactly one group and renders directly beneath its group header.
+- Added group-level visibility that excludes hidden groups from map picking and lasso selection without losing each track's own visibility preference.
+- Added moving selected tracks into existing or new groups; selecting and moving a whole group naturally merges it into another group.
+- Kept split, extracted, duplicated, staged, and merged tracks in their source group, including across undo and redo.
+- Added automatic project schema v1-to-v2 migration that preserves legacy memberships and assigns ungrouped tracks to a safe fallback **Tracks** group.
+
 ## 1.2.3 — 2026-07-24
 
 - Renamed the user-facing Layers tab to Tracks, matching the route objects managed there.

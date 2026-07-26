@@ -107,7 +107,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.core.content.ContextCompat
-import ch.cld9.velogpx.data.project.ProjectLayerGroup
+import ch.cld9.velogpx.data.project.ProjectTrackGroup
 import ch.cld9.velogpx.data.project.ProjectSaveStatus
 import ch.cld9.velogpx.engine.JoinGapStrategy
 import ch.cld9.velogpx.engine.ReverseTimePolicy
@@ -400,8 +400,10 @@ fun EditorScreen(viewModel: EditorViewModel) {
         dismissButton = { TextButton(onClick = { confirmBulkDelete = false }) { Text("Cancel") } },
     )
     if (groupDialog) GroupDialog(
+        groups = state.groups,
         dismiss = { groupDialog = false },
-        apply = { viewModel.createGroup(it); groupDialog = false },
+        create = { viewModel.createGroup(it); groupDialog = false },
+        moveTo = { viewModel.moveSelectedTracksToGroup(it); groupDialog = false },
     )
     if (mergeDialog) MergeMethodDialog(
         count = state.selectedTrackIds.ifEmpty { setOfNotNull(state.selectedTrackId) }.size,
@@ -483,7 +485,7 @@ private fun MapPanel(
     Box(Modifier.fillMaxSize()) {
         MapEditor(
             document = state.document,
-            styles = state.styles,
+            styles = state.mapStyles,
             selectedTrackIds = state.selectedTrackIds.ifEmpty { setOfNotNull(state.selectedTrackId) },
             selectedPoint = state.selectedPoint,
             selectedPosition = state.selectedCursor?.position?.point,
@@ -811,7 +813,7 @@ private fun TracksPanel(
                             OutlinedButton(onClick = viewModel::focusSelectedTracks, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Show on map") }
                             OutlinedButton(onClick = { viewModel.setSelectedTracksVisible(true) }, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Show") }
                             OutlinedButton(onClick = { viewModel.setSelectedTracksVisible(false) }, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Hide") }
-                            OutlinedButton(onClick = onGroup, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Group") }
+                            OutlinedButton(onClick = onGroup, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Move") }
                             OutlinedButton(onClick = onMerge, enabled = state.selectedTrackIds.size >= 2) { Text("Merge") }
                             OutlinedButton(onClick = onShare, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Garmin") }
                             OutlinedButton(onClick = onDelete, enabled = state.selectedTrackIds.isNotEmpty()) { Text("Delete") }
@@ -820,28 +822,35 @@ private fun TracksPanel(
                 }
             }
         }
-        if (state.groups.isNotEmpty()) {
-            item { Text("Groups", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) }
-            items(state.groups, key = { it.id }) { group ->
+        state.groups.forEach { group ->
+            item(key = "group-${group.id}") {
                 ListItem(
                     headlineContent = { Text(group.name) },
-                    supportingContent = { Text("${group.layerIds.size} track${if (group.layerIds.size == 1) "" else "s"}") },
+                    supportingContent = { Text("${group.trackIds.size} track${if (group.trackIds.size == 1) "" else "s"}${if (group.visible) "" else " · hidden"}") },
                     leadingContent = { Text(if (group.collapsed) "▸" else "▾") },
-                    trailingContent = { IconButton(onClick = { viewModel.deleteGroup(group.id) }) { Icon(Icons.Default.Delete, "Delete group") } },
+                    trailingContent = {
+                        Row {
+                            IconButton(onClick = { viewModel.selectGroup(group.id) }) { Icon(Icons.Default.DoneAll, "Select all tracks in group") }
+                            IconButton(onClick = { viewModel.toggleGroupVisibility(group.id) }) {
+                                Icon(if (group.visible) Icons.Default.Visibility else Icons.Default.VisibilityOff, "Toggle group visibility")
+                            }
+                            IconButton(onClick = { viewModel.deleteGroup(group.id) }, enabled = state.groups.size > 1) {
+                                Icon(Icons.Default.Delete, "Remove group and move its tracks to Tracks")
+                            }
+                        }
+                    },
                     modifier = Modifier.clickable { viewModel.toggleGroupCollapsed(group.id) },
                 )
+                HorizontalDivider()
             }
-            item { HorizontalDivider() }
-        }
-        items(TracksListLayout.visibleTracks(state.document.tracks, state.groups), key = { it.id }) { track ->
+            if (!group.collapsed) items(TracksListLayout.groupTracks(state.document.tracks, group), key = { it.id }) { track ->
             val selected = track.id in state.selectedTrackIds || (!state.selectionMode && track.id == state.selectedTrackId)
             val style = state.styles[track.id]
-            val group = state.groups.firstOrNull { track.id in it.layerIds }
             ListItem(
                 headlineContent = { Text(track.name ?: "Unnamed track", fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal) },
                 supportingContent = {
                     val stats = ch.cld9.velogpx.engine.GpxAnalytics.statistics(track)
-                    Text("${track.segments.size} segment${if (track.segments.size == 1) "" else "s"} · ${formatDistance(stats.distanceMeters)} · ${stats.pointCount} points${group?.let { " · ${it.name}" }.orEmpty()}")
+                    Text("${track.segments.size} segment${if (track.segments.size == 1) "" else "s"} · ${formatDistance(stats.distanceMeters)} · ${stats.pointCount} points")
                 },
                 leadingContent = {
                     if (state.selectionMode) {
@@ -891,6 +900,7 @@ private fun TracksPanel(
                 }
             }
             HorizontalDivider()
+            }
         }
         if (state.document.routes.isNotEmpty()) {
             item { Text("GPX routes", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(20.dp)) }
@@ -926,7 +936,7 @@ private fun TracksPanel(
 internal fun TracksListRevealEffect(
     request: TrackListFocusRequest?,
     tracks: List<GpxTrack>,
-    groups: List<ProjectLayerGroup>,
+    groups: List<ProjectTrackGroup>,
     selectionMode: Boolean,
     listState: LazyListState,
 ) {
@@ -1133,13 +1143,29 @@ private fun RenameDialog(current: String, dismiss: () -> Unit, apply: (String) -
 }
 
 @Composable
-private fun GroupDialog(dismiss: () -> Unit, apply: (String) -> Unit) {
+private fun GroupDialog(
+    groups: List<ProjectTrackGroup>,
+    dismiss: () -> Unit,
+    create: (String) -> Unit,
+    moveTo: (String) -> Unit,
+) {
     var name by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = dismiss,
-        title = { Text("Group selected tracks") },
-        text = { OutlinedTextField(name, { name = it }, label = { Text("Group name") }, singleLine = true) },
-        confirmButton = { Button(onClick = { apply(name) }, enabled = name.isNotBlank()) { Text("Create group") } },
+        title = { Text("Move selected tracks") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (groups.isNotEmpty()) {
+                    Text("Existing group", style = MaterialTheme.typography.labelLarge)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        groups.forEach { group -> AssistChip(onClick = { moveTo(group.id) }, label = { Text(group.name) }) }
+                    }
+                    HorizontalDivider()
+                }
+                OutlinedTextField(name, { name = it }, label = { Text("New group name") }, singleLine = true)
+            }
+        },
+        confirmButton = { Button(onClick = { create(name) }, enabled = name.isNotBlank()) { Text("Create and move") } },
         dismissButton = { TextButton(onClick = dismiss) { Text("Cancel") } },
     )
 }

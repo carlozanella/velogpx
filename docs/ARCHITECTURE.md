@@ -26,7 +26,7 @@ EditorViewModel ─── undo/redo snapshots ─── ProjectRepository
         └── RoutingProvider ─── BRouter HTTP implementation
 ```
 
-The source `GpxDocument` remains the interchange truth. Tracks retain segment boundaries, routes remain routes until an explicit conversion, and waypoints remain independent. Presentation state is stored beside GPX in the project archive: stable IDs, order, styles, source groups, multi-selection, layer scroll, camera, panel, and routing profile never leak into exported GPX.
+The source `GpxDocument` remains the interchange truth. Tracks retain segment boundaries, routes remain routes until an explicit conversion, and waypoints remain independent. GPX has no standard grouping construct, so presentation state is stored beside it in the project archive: stable IDs, order, styles, exclusive group membership and visibility, multi-selection, track-list scroll, camera, panel, and routing profile never leak into exported GPX. Project schema v2 migrates legacy `layerIds`, preserves existing memberships, and assigns every ungrouped track to a fallback **Tracks** group.
 
 `TrackPositionEngine` is the single definition of a continuous position along a multi-segment track. The map cursor, interactive elevation profile, point details, and foreground device-location projection all consume that model. Distances continue across segment boundaries without inventing distance across their gaps. A position can identify an exact recorded point or an interpolated fraction of an edge.
 

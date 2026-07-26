@@ -41,7 +41,7 @@ class ProjectArchiveCodecTest {
             editor = ProjectEditorState(
                 layerOrder = listOf(track.id),
                 styles = mapOf(track.id to TrackStyle(0xFF1565C0, visible = false, widthDp = 7f)),
-                groups = listOf(ProjectLayerGroup("group-id", "France", listOf(track.id), collapsed = true)),
+                groups = listOf(ProjectTrackGroup("group-id", "France", listOf(track.id), collapsed = true, visible = false)),
                 selectedTrackId = track.id,
                 selectedTrackIds = listOf(track.id),
                 selectedPoint = ProjectSelection(track.id, 0, 1, 470500000, 80500000),
@@ -103,13 +103,23 @@ class ProjectArchiveCodecTest {
         FileOutputStream(original).use { ProjectArchiveCodec().write(project, it) }
         val legacy = temporary.newFile("legacy-v1.velogpx")
         rewriteManifest(original, legacy) { manifest ->
+            manifest.put("schemaVersion", 1)
             manifest.getJSONObject("editor").remove("selectedTrackIds")
+            manifest.getJSONObject("editor").getJSONArray("groups").let { groups ->
+                for (index in 0 until groups.length()) {
+                    val group = groups.getJSONObject(index)
+                    group.put("layerIds", group.remove("trackIds"))
+                    group.remove("visible")
+                }
+            }
             manifest
         }
 
         val loaded = ProjectArchiveCodec().read(legacy)
 
         assertEquals(listOf(track.id), loaded.editor.selectedTrackIds)
+        assertEquals(listOf(track.id), loaded.editor.groups.single().trackIds)
+        assertEquals(true, loaded.editor.groups.single().visible)
     }
 
     @Test fun archiveRoundTripPreservesAnExplicitlyEmptySelection() {

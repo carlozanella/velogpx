@@ -8,7 +8,7 @@ import java.time.Instant
 import java.util.UUID
 
 const val PROJECT_FORMAT = "ch.cld9.velogpx.project"
-const val PROJECT_SCHEMA_VERSION = 1
+const val PROJECT_SCHEMA_VERSION = 2
 const val PROJECT_MIME_TYPE = "application/vnd.cld9.velogpx.project+zip"
 
 data class ProjectCamera(
@@ -28,17 +28,18 @@ data class ProjectSelection(
     val timeEpochMillis: Long? = null,
 )
 
-data class ProjectLayerGroup(
+data class ProjectTrackGroup(
     val id: String = UUID.randomUUID().toString(),
     val name: String,
-    val layerIds: List<String> = emptyList(),
+    val trackIds: List<String> = emptyList(),
     val collapsed: Boolean = false,
+    val visible: Boolean = true,
 )
 
 data class ProjectEditorState(
     val layerOrder: List<String> = emptyList(),
     val styles: Map<String, TrackStyle> = emptyMap(),
-    val groups: List<ProjectLayerGroup> = emptyList(),
+    val groups: List<ProjectTrackGroup> = emptyList(),
     val selectedTrackId: String? = null,
     val selectedTrackIds: List<String> = emptyList(),
     val selectedPoint: ProjectSelection? = null,
@@ -106,9 +107,32 @@ fun defaultEditorState(document: GpxDocument) = ProjectEditorState(
     styles = document.tracks.mapIndexed { index, track ->
         track.id to TrackStyle(DEFAULT_PROJECT_COLORS[index % DEFAULT_PROJECT_COLORS.size])
     }.toMap(),
+    groups = defaultTrackGroups(document.tracks.map(GpxTrack::id)),
     selectedTrackId = document.tracks.firstOrNull()?.id,
     selectedTrackIds = document.tracks.firstOrNull()?.let { listOf(it.id) }.orEmpty(),
 )
+
+fun defaultTrackGroups(trackIds: List<String>): List<ProjectTrackGroup> =
+    if (trackIds.isEmpty()) emptyList() else listOf(ProjectTrackGroup(name = "Tracks", trackIds = trackIds))
+
+/** Ensures every current track belongs to exactly one non-empty group. First membership wins. */
+fun normalizeTrackGroups(trackIds: List<String>, groups: List<ProjectTrackGroup>): List<ProjectTrackGroup> {
+    val valid = trackIds.toSet()
+    val assigned = mutableSetOf<String>()
+    val normalized = groups.mapNotNull { group ->
+        val members = group.trackIds.filter { it in valid && assigned.add(it) }
+        group.copy(trackIds = members).takeIf { members.isNotEmpty() }
+    }.toMutableList()
+    val unassigned = trackIds.filterNot(assigned::contains)
+    if (unassigned.isNotEmpty()) {
+        val fallbackIndex = normalized.indexOfFirst { it.name == "Tracks" }
+        if (fallbackIndex >= 0) {
+            val fallback = normalized[fallbackIndex]
+            normalized[fallbackIndex] = fallback.copy(trackIds = fallback.trackIds + unassigned)
+        } else normalized += ProjectTrackGroup(name = "Tracks", trackIds = unassigned)
+    }
+    return normalized
+}
 
 data class ProjectSummary(
     val id: String,

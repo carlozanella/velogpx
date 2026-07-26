@@ -6,7 +6,7 @@ VeloGPX is a local-first Android GPX editor built for assembling long bicycle to
 
 - Imports several GPX 1.0/1.1 files through Android's file picker, share sheet, or “Open with”.
 - Preserves tracks, track segments, routes, waypoints, metadata, timestamps, elevation, legacy course/speed, and namespace-aware extension XML.
-- Overlays every track in a color-coded layer list with exact map focus, direct line picking, long-press and freehand-lasso multi-selection, combined selection profiles/totals, bulk show/hide/delete/share/merge, source groups, and collapsible groups.
+- Organizes every track in a color-coded group list with exact map focus, direct line picking, long-press and freehand-lasso multi-selection, combined selection profiles/totals, bulk show/hide/delete/share/merge, movable membership, and collapsible/visible groups.
 - Provides an explicit BRouter planner for start, end, and via anchors; touring, road, gravel, low-traffic, and shortest profiles; up to four preview alternatives; and safe new/append/prepend application.
 - Selects, moves, deletes, trims, repeatedly splits, and extracts spans directly from the map with transactional previews.
 - Guides merging selected tracks through an optimized order/orientation preview, preserve-gap/direct/BRouter connector policies, exact connector endpoints, and keep-or-replace source choice.
@@ -15,14 +15,14 @@ VeloGPX is a local-first Android GPX editor built for assembling long bicycle to
 - Shows WGS84 distance, ascent/descent, time, speed, point counts, and an interactive distance/elevation profile on the map with exact point/edge details.
 - Shows current location on request and projects it onto the selected route/profile only when it is within 200 m.
 - Exports the whole project, only the selected track, or a ZIP containing one GPX per track/day, and opens projects/tracks/segments as real GPX documents in Garmin Connect. Garmin handoffs use one continuous course so Connect retains every requested segment.
-- Stores multiple named projects as checksummed atomic `.velogpx` archives, restores the last project/camera/layers/groups/selection, autosaves every change, rotates recovery snapshots, and provides 75-step undo/redo.
+- Stores multiple named projects as checksummed atomic `.velogpx` archives, restores the last project/camera/groups/selection, autosaves every change, rotates recovery snapshots, and provides 75-step undo/redo.
 - Uses OpenFreeMap/MapLibre without an API key. GPX editing and export work without a backend.
 
 No account, analytics SDK, broad storage permission, or VeloGPX backend is used. Foreground location permission is requested only when you tap the location button. Online map display and optional public BRouter requests require internet; file editing does not.
 
 ## Install
 
-Download `VeloGPX-1.2.3.apk` from the latest GitHub Release and allow installation from your browser/files app. The release APK is signed with a development key for direct personal installation.
+Download `VeloGPX-1.3.0.apk` from the latest GitHub Release and allow installation from your browser/files app. The release APK is signed with a development key for direct personal installation.
 
 Android 8.0 (API 26) or newer is supported. The app targets Android 17/API 37.
 
@@ -45,7 +45,7 @@ The release build intentionally uses the standard Android debug signing key for 
 ## Using the editor
 
 1. Tap the folder icon, choose one or several GPX files, then add them to this project or create a new one. Each file becomes a source group and exact reimports are skipped.
-2. Use **Tracks** to find and focus a route, or tap **Multi** on the map / **Select** in Tracks for bulk actions, grouping, merging, or Garmin handoff. Opening Tracks automatically reveals the primary map selection.
+2. Use **Tracks** to collapse or hide whole groups. Select a group or individual tracks, then use **Move** to create, move into, or merge groups. Hidden groups stay out of map taps and lasso selection, so you can isolate one import, trim it, and restore the others afterward.
 3. On **Map**, use Select, Line, Move, Split, or POI. Tap **Plan** for the dedicated route planner; it never chooses a hidden starting point.
 4. For merging, select two or more tracks, choose preserved gaps, direct lines, or bicycle-planned connections, then preview order, direction, output name, and source retention.
 5. In Split mode, tap the rendered track, add one or several cut markers, then split once or extract the span between exactly two markers.

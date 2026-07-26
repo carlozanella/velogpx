@@ -230,7 +230,8 @@ internal object ProjectJson {
             }
         })
         put("groups", JSONArray(editor.groups.map { group -> JSONObject().apply {
-            put("id", group.id); put("name", group.name); put("layerIds", JSONArray(group.layerIds)); put("collapsed", group.collapsed)
+            put("id", group.id); put("name", group.name); put("trackIds", JSONArray(group.trackIds))
+            put("collapsed", group.collapsed); put("visible", group.visible)
         } }))
         put("selectedTrackId", editor.selectedTrackId ?: JSONObject.NULL)
         put("selectedTrackIds", JSONArray(editor.selectedTrackIds))
@@ -261,11 +262,12 @@ internal object ProjectJson {
             }
         }
         val groups = (json.optJSONArray("groups") ?: JSONArray()).objects().map { value ->
-            ProjectLayerGroup(
+            ProjectTrackGroup(
                 id = value.getString("id"),
                 name = value.getString("name"),
-                layerIds = value.stringList("layerIds"),
+                trackIds = value.stringList("trackIds"),
                 collapsed = value.optBoolean("collapsed", false),
+                visible = value.optBoolean("visible", true),
             )
         }
         val selection = json.nullableObject("selectedPoint")?.let { value ->
@@ -361,7 +363,7 @@ private fun ProjectState.sanitizeEditorReferences(): ProjectState {
     return copy(editor = editor.copy(
         layerOrder = order,
         styles = editor.styles.filterKeys { it in valid },
-        groups = editor.groups.map { it.copy(layerIds = it.layerIds.filter { id -> id in valid }.distinct()) },
+        groups = normalizeTrackGroups(trackIds, editor.groups),
         selectedTrackId = selectedTrack,
         selectedTrackIds = editor.selectedTrackIds.filter { it in valid }.distinct(),
         selectedPoint = selectedPoint,

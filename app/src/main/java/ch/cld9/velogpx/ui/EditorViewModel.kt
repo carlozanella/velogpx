@@ -9,7 +9,8 @@ import ch.cld9.velogpx.VeloGpxApplication
 import ch.cld9.velogpx.data.project.ProjectAutosaveSession
 import ch.cld9.velogpx.data.project.ProjectCamera
 import ch.cld9.velogpx.data.project.ProjectEditorState
-import ch.cld9.velogpx.data.project.ProjectLayerGroup
+import ch.cld9.velogpx.data.project.ProjectTrackGroup
+import ch.cld9.velogpx.data.project.normalizeTrackGroups
 import ch.cld9.velogpx.data.project.ProjectOpenResult
 import ch.cld9.velogpx.data.project.ProjectRecoverySource
 import ch.cld9.velogpx.data.project.ProjectSaveStatus
@@ -103,6 +104,7 @@ data class MapTrackChoice(
 )
 
 data class TrackListFocusRequest(val generation: Long, val trackId: String)
+private data class EditorHistoryState(val document: GpxDocument, val groups: List<ProjectTrackGroup>)
 
 data class PointSelection(
     val trackId: String,
@@ -146,7 +148,7 @@ data class EditorUiState(
     val projectTitle: String = "Untitled bicycle tour",
     val projects: List<ProjectSummary> = emptyList(),
     val saveStatus: ProjectSaveStatus? = null,
-    val groups: List<ProjectLayerGroup> = emptyList(),
+    val groups: List<ProjectTrackGroup> = emptyList(),
     val camera: MapCameraState? = null,
     val focusRequest: MapFocusRequest? = null,
     val trackListFocusRequest: TrackListFocusRequest? = null,
@@ -163,6 +165,13 @@ data class EditorUiState(
 ) {
     val selectedTrack: GpxTrack? get() = document.tracks.firstOrNull { it.id == selectedTrackId }
     val selectedStatistics: TrackStatistics? get() = selectedTrack?.let(GpxAnalytics::statistics)
+    val mapStyles: Map<String, TrackStyle>
+        get() {
+            val hiddenByGroup = groups.filterNot(ProjectTrackGroup::visible).flatMapTo(mutableSetOf(), ProjectTrackGroup::trackIds)
+            return styles.mapValues { (id, style) ->
+                if (id in hiddenByGroup) style.copy(visible = false) else style
+            }
+        }
 
     val draftAnchors: List<GpxPoint>
         get() = when {
@@ -221,8 +230,8 @@ data class EditorUiState(
 class EditorViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = (application as VeloGpxApplication).projectRepository
     private val router = BRouterClient()
-    private val undo = ArrayDeque<GpxDocument>()
-    private val redo = ArrayDeque<GpxDocument>()
+    private val undo = ArrayDeque<EditorHistoryState>()
+    private val redo = ArrayDeque<EditorHistoryState>()
     private val parser = GpxParser()
     private val writer = GpxWriter()
     private val focusGeneration = AtomicLong()
@@ -592,12 +601,12 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             val base = if (current.isEmpty) documentsWithData.first() else current
             val rest = if (current.isEmpty) documentsWithData.drop(1) else documentsWithData
             val merged = GpxOperations.mergeDocuments(base, rest)
-            val usedGroupNames = (if (intoNewProject) emptyList() else _state.value.groups.map(ProjectLayerGroup::name)).toMutableSet()
+            val usedGroupNames = (if (intoNewProject) emptyList() else _state.value.groups.map(ProjectTrackGroup::name)).toMutableSet()
             val importedGroups = filteredDocuments.mapNotNull { document ->
                 val ids = document.tracks.map(GpxTrack::id)
-                if (ids.isEmpty()) null else ProjectLayerGroup(
+                if (ids.isEmpty()) null else ProjectTrackGroup(
                     name = uniqueGroupName(importGroupName(document), usedGroupNames),
-                    layerIds = ids,
+                    trackIds = ids,
                 )
             }
             val importedPoints = filteredDocuments.flatMap { document ->
@@ -635,7 +644,10 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 commit(merged.value, selectedTrackId = firstImportedTrackId ?: _state.value.selectedTrackId, message = message)
                 _state.update {
                     it.copy(
-                        groups = previousGroups + importedGroups,
+                        groups = normalizeTrackGroups(
+                            it.document.tracks.map(GpxTrack::id),
+                            previousGroups.map { group -> group.copy(trackIds = group.trackIds - importedGroups.flatMap(ProjectTrackGroup::trackIds).toSet()) } + importedGroups,
+                        ),
                         busy = false,
                         panel = EditorPanel.MAP,
                         focusRequest = importedPoints.takeIf { points -> points.isNotEmpty() }
@@ -785,13 +797,13 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     fun undo() {
         val previous = undo.removeLastOrNull() ?: return
-        redo.addLast(_state.value.document)
+        redo.addLast(EditorHistoryState(_state.value.document, _state.value.groups))
         replaceWithoutHistory(previous, "Undid last edit.")
     }
 
     fun redo() {
         val next = redo.removeLastOrNull() ?: return
-        undo.addLast(_state.value.document)
+        undo.addLast(EditorHistoryState(_state.value.document, _state.value.groups))
         replaceWithoutHistory(next, "Redid edit.")
     }
 
@@ -931,6 +943,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
         val track = _state.value.document.tracks.firstOrNull { it.id == draft.trackId } ?: return
+        val sourceGroup = groupForTrack(track.id)
         val result = runCatching { TrackRangeEngine.splitAtLocations(track, draft.cuts) }.getOrElse { error ->
             _state.update { it.copy(message = error.message ?: "The requested cuts could not be applied.") }
             return
@@ -945,6 +958,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             selectedTrackId = result.tracks.firstOrNull()?.id,
             message = "Split into ${result.tracks.size} tracks in one undoable edit.",
         )
+        assignTracksToGroup(result.tracks.mapTo(linkedSetOf(), GpxTrack::id), sourceGroup)
         _state.update { it.copy(splitDraft = null, editMode = EditMode.SELECT) }
     }
 
@@ -959,6 +973,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
         val track = _state.value.document.tracks.firstOrNull { it.id == draft.trackId } ?: return
+        val sourceGroup = groupForTrack(track.id)
         val result = runCatching { TrackRangeEngine.extractSpan(track, draft.cuts[0], draft.cuts[1], reverseWhenBackwards = true) }
             .getOrElse { error ->
                 _state.update { it.copy(message = error.message ?: "The selected span could not be extracted.") }
@@ -969,6 +984,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             selectedTrackId = result.track.id,
             message = result.warnings.firstOrNull() ?: "Extracted the selected span as a new track.",
         )
+        assignTracksToGroup(setOf(result.track.id), sourceGroup)
         _state.update { it.copy(splitDraft = null, editMode = EditMode.SELECT) }
     }
 
@@ -998,6 +1014,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun splitSelected() {
         val selection = _state.value.selectedPoint ?: return
         val track = _state.value.document.tracks.firstOrNull { it.id == selection.trackId } ?: return
+        val sourceGroup = groupForTrack(track.id)
         val segment = track.segments.getOrNull(selection.segmentIndex) ?: return
         if (segment.points.size < 2) return
         val (left, right) = GpxOperations.splitTrack(track, selection.segmentIndex, selection.pointIndex)
@@ -1006,6 +1023,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         tracks.removeAt(index)
         tracks.addAll(index, listOf(left, right))
         commit(_state.value.document.copy(tracks = tracks), selectedTrackId = right.id, message = "Track split into two tracks.")
+        assignTracksToGroup(setOf(left.id, right.id), sourceGroup)
         _state.update { it.copy(selectedPoint = null, selectedCursor = null, editMode = EditMode.SELECT) }
     }
 
@@ -1078,9 +1096,11 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun mergeAll(stitch: Boolean) {
         val tracks = _state.value.document.tracks
         if (tracks.size < 2) return
+        val destinationGroup = groupForTrack(_state.value.selectedTrackId ?: tracks.first().id)
         val merged = if (stitch) GpxOperations.stitch(tracks) else GpxOperations.combineAsSegments(tracks)
         commit(_state.value.document.copy(tracks = listOf(merged)), selectedTrackId = merged.id,
             message = if (stitch) "Tracks stitched into one continuous segment." else "Tracks combined while preserving segment gaps.")
+        assignTracksToGroup(setOf(merged.id), destinationGroup)
     }
 
     fun autoOrderAndOrientTracks() {
@@ -1126,6 +1146,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     fun planDailyStages(targetKilometers: Double) {
         val track = _state.value.selectedTrack ?: return
+        val sourceGroup = groupForTrack(track.id)
         val plan = StagePlanner.byDistance(track, targetKilometers * 1000.0)
         val index = _state.value.document.tracks.indexOfFirst { it.id == track.id }
         val tracks = _state.value.document.tracks.toMutableList().apply {
@@ -1137,6 +1158,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             selectedTrackId = plan.stages.firstOrNull()?.id,
             message = "Created ${plan.stages.size} daily stages around ${targetKilometers.toInt()} km each.",
         )
+        assignTracksToGroup(plan.stages.mapTo(linkedSetOf(), GpxTrack::id), sourceGroup)
     }
 
     fun convertSelectedRouteToTrack(routeId: String) {
@@ -1185,15 +1207,38 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun createGroup(name: String) {
         val ids = _state.value.selectedTrackIds.ifEmpty { setOfNotNull(_state.value.selectedTrackId) }
         if (ids.isEmpty() || name.isBlank()) return
-        val group = ProjectLayerGroup(name = name.trim(), layerIds = ids.toList())
         _state.update { state ->
-            state.copy(groups = state.groups.map { it.copy(layerIds = it.layerIds.filterNot(ids::contains)) } + group)
+            val uniqueName = uniqueGroupName(name.trim(), state.groups.mapTo(mutableSetOf(), ProjectTrackGroup::name))
+            val group = ProjectTrackGroup(name = uniqueName, trackIds = ids.toList())
+            state.copy(groups = normalizeTrackGroups(
+                state.document.tracks.map(GpxTrack::id),
+                state.groups.map { it.copy(trackIds = it.trackIds.filterNot(ids::contains)) } + group,
+            ))
+        }
+        persistEditorState()
+    }
+
+    fun moveSelectedTracksToGroup(groupId: String) {
+        val ids = _state.value.selectedTrackIds.ifEmpty { setOfNotNull(_state.value.selectedTrackId) }
+        assignTracksToGroup(ids, _state.value.groups.firstOrNull { it.id == groupId })
+    }
+
+    fun selectGroup(groupId: String) {
+        val group = _state.value.groups.firstOrNull { it.id == groupId } ?: return
+        _state.update { state ->
+            val ids = group.trackIds.filterTo(linkedSetOf()) { id -> state.document.tracks.any { it.id == id } }
+            state.copy(selectionMode = true, selectedTrackIds = ids, selectedTrackId = ids.firstOrNull(), selectedPoint = null)
         }
         persistEditorState()
     }
 
     fun deleteGroup(groupId: String) {
-        _state.update { it.copy(groups = it.groups.filterNot { group -> group.id == groupId }) }
+        _state.update { state ->
+            state.copy(groups = normalizeTrackGroups(
+                state.document.tracks.map(GpxTrack::id),
+                state.groups.filterNot { group -> group.id == groupId },
+            ))
+        }
         persistEditorState()
     }
 
@@ -1206,14 +1251,46 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         persistEditorState()
     }
 
+    fun toggleGroupVisibility(groupId: String) {
+        _state.update { state ->
+            state.copy(groups = state.groups.map { group ->
+                if (group.id == groupId) group.copy(visible = !group.visible) else group
+            })
+        }
+        persistEditorState()
+    }
+
+    private fun groupForTrack(trackId: String): ProjectTrackGroup? =
+        _state.value.groups.firstOrNull { trackId in it.trackIds }
+
+    private fun assignTracksToGroup(trackIds: Set<String>, destination: ProjectTrackGroup?) {
+        if (trackIds.isEmpty() || destination == null) return
+        _state.update { state ->
+            val validIds = trackIds.filterTo(linkedSetOf()) { id -> state.document.tracks.any { it.id == id } }
+            if (validIds.isEmpty()) return@update state
+            val withoutMoved = state.groups.map { it.copy(trackIds = it.trackIds.filterNot(validIds::contains)) }.toMutableList()
+            val destinationIndex = withoutMoved.indexOfFirst { it.id == destination.id }
+            if (destinationIndex >= 0) {
+                val current = withoutMoved[destinationIndex]
+                withoutMoved[destinationIndex] = current.copy(trackIds = current.trackIds + validIds)
+            } else {
+                withoutMoved += destination.copy(trackIds = validIds.toList())
+            }
+            state.copy(groups = normalizeTrackGroups(state.document.tracks.map(GpxTrack::id), withoutMoved))
+        }
+        persistEditorState()
+    }
+
     fun duplicateSelectedTrack() {
         val track = _state.value.selectedTrack ?: return
+        val sourceGroup = groupForTrack(track.id)
         val duplicate = track.copy(
             id = UUID.randomUUID().toString(),
             name = (track.name ?: "Track") + " copy",
             segments = track.segments.map { it.copy(id = UUID.randomUUID().toString(), points = it.points.map { point -> point.copy(id = UUID.randomUUID().toString()) }) },
         )
         commit(_state.value.document.copy(tracks = _state.value.document.tracks + duplicate), selectedTrackId = duplicate.id, message = "Track duplicated.")
+        assignTracksToGroup(setOf(duplicate.id), sourceGroup)
     }
 
     fun prepareJoin(strategy: JoinGapStrategy = JoinGapStrategy.PRESERVE_SEGMENT_GAP) {
@@ -1348,6 +1425,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
         val joinedIds = draft.plan.order.mapTo(linkedSetOf()) { it.trackId }
+        val destinationGroup = joinedIds.firstNotNullOfOrNull(::groupForTrack)
         val old = _state.value.document.tracks
         val insertion = old.indexOfFirst { it.id in joinedIds }.coerceAtLeast(0)
         val tracks = if (draft.keepOriginals) {
@@ -1360,6 +1438,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             selectedTrackId = joined.id,
             message = "Merged ${joinedIds.size} tracks${if (draft.keepOriginals) " and kept the sources" else ""}.",
         )
+        assignTracksToGroup(setOf(joined.id), destinationGroup)
         _state.update { it.copy(joinDraft = null, selectionMode = false, selectedTrackIds = setOf(joined.id)) }
     }
 
@@ -1601,7 +1680,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     ) {
         if (document == _state.value.document) return
         routeJob?.cancel()
-        undo.addLast(_state.value.document)
+        undo.addLast(EditorHistoryState(_state.value.document, _state.value.groups))
         while (undo.size > 75) undo.removeFirst()
         redo.clear()
         val styles = _state.value.styles.toMutableMap()
@@ -1611,6 +1690,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             it.copy(
                 document = document,
                 styles = styles,
+                groups = normalizeTrackGroups(document.tracks.map(GpxTrack::id), it.groups),
                 selectedTrackId = selectedTrackId,
                 selectedTrackIds = setOfNotNull(selectedTrackId),
                 selectionMode = false,
@@ -1629,14 +1709,16 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         persistProject(documentChanged = true)
     }
 
-    private fun replaceWithoutHistory(document: GpxDocument, message: String) {
+    private fun replaceWithoutHistory(snapshot: EditorHistoryState, message: String) {
         routeJob?.cancel()
+        val document = snapshot.document
         val selected = _state.value.selectedTrackId?.takeIf { id -> document.tracks.any { it.id == id } }
             ?: document.tracks.firstOrNull()?.id
         _state.update {
             it.copy(
                 document = document,
                 styles = stylesFor(document.tracks, it.styles),
+                groups = normalizeTrackGroups(document.tracks.map(GpxTrack::id), snapshot.groups),
                 selectedTrackId = selected,
                 selectedTrackIds = setOfNotNull(selected),
                 selectionMode = false,
@@ -1698,7 +1780,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             projectId = opened.id,
             projectTitle = opened.title,
             saveStatus = ProjectSaveStatus.Saved(opened.revision),
-            groups = editor.groups,
+            groups = normalizeTrackGroups(document.tracks.map(GpxTrack::id), editor.groups),
             camera = editor.camera?.let { MapCameraState(it.latitude, it.longitude, it.zoom, it.bearing, it.pitch) },
             message = result.warnings.firstOrNull(),
             layersScrollIndex = editor.layersScrollIndex,
