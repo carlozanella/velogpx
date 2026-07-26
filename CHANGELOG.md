@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.1 — 2026-07-26
+
+- Fixed selected-track handles, cursor, and location projection continuing to reveal a track after its group was hidden.
+- Made CI release signing stable and added a certificate-continuity release gate so future APKs remain installable as updates.
+
 ## 1.3.0 — 2026-07-26
 
 - Made groups real track-list containers: every track belongs to exactly one group and renders directly beneath its group header.

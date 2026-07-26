@@ -5,6 +5,7 @@ import ch.cld9.velogpx.model.GpxDocument
 import ch.cld9.velogpx.model.GpxPoint
 import ch.cld9.velogpx.model.GpxTrack
 import ch.cld9.velogpx.model.GpxTrackSegment
+import ch.cld9.velogpx.model.TrackStyle
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
@@ -12,6 +13,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MapSelectionTest {
+    @Test fun hiddenSelectedTrackDoesNotProduceSelectionOverlays() {
+        val selected = GpxTrack(id = "selected")
+        val document = GpxDocument(tracks = listOf(selected))
+
+        assertNull(visibleSelectedTrack(document, mapOf(selected.id to TrackStyle(0xFF176B45, visible = false)), setOf(selected.id)))
+        assertSame(selected, visibleSelectedTrack(document, mapOf(selected.id to TrackStyle(0xFF176B45, visible = true)), setOf(selected.id)))
+    }
+
     @Test fun emptyMapTapClearsSelectionWithoutLeavingMultiSelectOrChangingDocument() {
         val track = GpxTrack(
             id = "ev5",

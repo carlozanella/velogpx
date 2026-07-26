@@ -38,7 +38,7 @@ jobs:
       - name: Verify stable release certificate
         if: ${{ env.ANDROID_KEYSTORE_PATH != '' }}
         run: |
-          apksigner verify --print-certs app/build/outputs/apk/release/app-release.apk \
+          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --print-certs app/build/outputs/apk/release/app-release.apk \
             | grep -qi "SHA-256 digest: 3e1a260affdef2de500ca723a47cfe22c3dd09597271a1213ed4e9cbb04521b8"
       - uses: actions/upload-artifact@v7
         with:

@@ -334,10 +334,15 @@ private class MapRenderer {
             ))
         }
         syncWaypoints(style, payload.document.waypoints)
-        val selectedTrack = payload.document.tracks.firstOrNull { it.id == payload.selectedTrackIds.firstOrNull() }
+        val selectedTrack = visibleSelectedTrack(payload.document, payload.styles, payload.selectedTrackIds)
         syncHandles(style, payload.selectedPoint, selectedTrack)
         syncDraft(style, payload.draftLines, payload.draftAnchors)
-        syncPositionMarkers(style, payload.selectedPosition, payload.currentLocation, payload.currentLocationProjection)
+        syncPositionMarkers(
+            style,
+            payload.selectedPosition.takeIf { selectedTrack != null },
+            payload.currentLocation,
+            payload.currentLocationProjection.takeIf { selectedTrack != null },
+        )
     }
 
     fun applyInitialCamera(map: MapLibreMap, camera: MapCameraState?, document: GpxDocument, mapView: MapView) {
