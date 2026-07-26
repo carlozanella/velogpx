@@ -40,7 +40,7 @@ The local build produces:
 - `app/build/outputs/apk/debug/app-debug.apk`
 - `app/build/outputs/apk/release/app-release.apk`
 
-The release build intentionally uses the standard Android debug signing key for this personal pre-Play release. Configure a private release keystore before publishing to an app store.
+Published releases use one protected, stable signing key so APK updates install over earlier versions. Local release builds fall back to the standard Android debug key unless `ANDROID_KEYSTORE_PATH`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD` are configured. Configure a private production keystore before publishing to an app store.
 
 ## Using the editor
 

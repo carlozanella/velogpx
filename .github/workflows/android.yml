@@ -21,8 +21,25 @@ jobs:
       - uses: android-actions/setup-android@v4
       - name: Install Android SDK
         run: sdkmanager "platform-tools" "platforms;android-37.0" "build-tools;37.0.0"
+      - name: Prepare stable release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/velogpx-release.jks"
+            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/velogpx-release.jks" >> "$GITHUB_ENV"
+          fi
       - name: Test, lint, and assemble
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: ./gradlew testDebugUnitTest lintDebug assembleDebug assembleRelease
+      - name: Verify stable release certificate
+        if: ${{ env.ANDROID_KEYSTORE_PATH != '' }}
+        run: |
+          apksigner verify --print-certs app/build/outputs/apk/release/app-release.apk \
+            | grep -qi "SHA-256 digest: 3e1a260affdef2de500ca723a47cfe22c3dd09597271a1213ed4e9cbb04521b8"
       - uses: actions/upload-artifact@v7
         with:
           name: VeloGPX-APKs
