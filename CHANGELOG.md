@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.0 — 2026-07-27
+
+- Added a **Load terrain elevation** wand action that fills only missing values from the worldwide 90 m Copernicus DEM via Open-Meteo, with bounded batching, cancellation, stale-result protection, attribution, and one-step undo.
+
 ## 1.3.1 — 2026-07-26
 
 - Fixed selected-track handles, cursor, and location projection continuing to reveal a track after its group was hidden.

@@ -22,6 +22,7 @@ EditorViewModel ─── undo/redo snapshots ─── ProjectRepository
         ├── edit engine (range/split/merge/trim/reverse/clean/time/elevation/stages)
         ├── track-position engine (distance profile/cursor/location projection)
         ├── import identity engine (source grouping + exact geometry deduplication)
+        ├── elevation provider (sampled missing points → Open-Meteo Copernicus GLO-90 → interpolation)
         ├── analysis engine (geodesic distance/elevation/time/speed)
         └── RoutingProvider ─── BRouter HTTP implementation
 ```
@@ -39,6 +40,8 @@ Unknown extension nodes retain namespace URI, local name, prefix hint, ordered a
 ## Map and network policy
 
 MapLibre renders per-track GeoJSON sources; only cached sampled edit handles are displayed for large tracks while full geometry remains in the model/export. Elevation drawing is peak-preserving and bounded to 3,000 chart samples, while cursor calculations retain full precision. OpenFreeMap avoids an SDK key and explicitly supports public use. VeloGPX never bulk-downloads the OpenStreetMap standard tile service.
+
+Terrain elevation enrichment is an explicit, transactional transform. It selects anchors only inside missing-elevation runs, at roughly twice the source DEM resolution, and batches at the provider's 100-coordinate limit. The provider response is validated completely before any model change; recorded elevations are never overwritten, intermediate points are distance-interpolated between terrain/recorded anchors, stale results are discarded, and the final track replacement is one undoable edit. Attribution: Copernicus DEM GLO-90, delivered by Open-Meteo.
 
 All editing functions are local. `RoutingProvider` is replaceable: VeloGPX uses BRouter's public HTTPS endpoint only after the dedicated planner receives explicit start/end anchors or the user chooses planned merge connections. Requests/results are typed, cancellable, size-limited, and revision/token/profile-bound. A bundled/offline BRouter provider can be added without changing the editor engine. No helo backend is deployed.
 

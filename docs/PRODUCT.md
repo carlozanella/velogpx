@@ -22,7 +22,7 @@ The baseline reviewed was [gpx.studio](https://gpx.studio/help/toolbar): multi-f
 3. Multi-source tracks with exact focus, rendered-line selection, overlap disambiguation, exclusive groups, persistent multi-select, and bulk operations.
 4. Transactional repeated split/span extraction and guided selected-track joining with optimized orientation, explicit gap policy, routed connectors, and safe source retention.
 5. A dedicated explicit BRouter planner with start/end/vias, five profiles, alternatives 0–3, metrics, cancellation/staleness safety, and new/append/prepend modes.
-6. Simplification, duplicate/spike removal, elevation smoothing/interpolation, and timestamp generation/shift/clear.
+6. Simplification, duplicate/spike removal, explicit Copernicus terrain-elevation loading for missing samples, elevation smoothing/interpolation, and timestamp generation/shift/clear.
 7. WGS84 geodesic statistics, segment-gap-safe distance, elevation profile, and daily-stage generation.
 8. Android Storage Access Framework/share-intent integration plus Garmin Connect project/track/segment sharing, without broad storage permission or a backend.
 

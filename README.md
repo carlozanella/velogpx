@@ -10,7 +10,7 @@ VeloGPX is a local-first Android GPX editor built for assembling long bicycle to
 - Provides an explicit BRouter planner for start, end, and via anchors; touring, road, gravel, low-traffic, and shortest profiles; up to four preview alternatives; and safe new/append/prepend application.
 - Selects, moves, deletes, trims, repeatedly splits, and extracts spans directly from the map with transactional previews.
 - Guides merging selected tracks through an optimized order/orientation preview, preserve-gap/direct/BRouter connector policies, exact connector endpoints, and keep-or-replace source choice.
-- Removes duplicates and likely GPS spikes, simplifies geometry with protected semantic points, smooths/fills elevation, and generates/shifts/removes timestamps.
+- Removes duplicates and likely GPS spikes, simplifies geometry with protected semantic points, loads missing terrain elevation from the Copernicus GLO-90 DEM, smooths/interpolates elevation, and generates/shifts/removes timestamps.
 - Splits a master route into exact, consecutively numbered daily stages by target distance.
 - Shows WGS84 distance, ascent/descent, time, speed, point counts, and an interactive distance/elevation profile on the map with exact point/edge details.
 - Shows current location on request and projects it onto the selected route/profile only when it is within 200 m.
@@ -18,11 +18,11 @@ VeloGPX is a local-first Android GPX editor built for assembling long bicycle to
 - Stores multiple named projects as checksummed atomic `.velogpx` archives, restores the last project/camera/groups/selection, autosaves every change, rotates recovery snapshots, and provides 75-step undo/redo.
 - Uses OpenFreeMap/MapLibre without an API key. GPX editing and export work without a backend.
 
-No account, analytics SDK, broad storage permission, or VeloGPX backend is used. Foreground location permission is requested only when you tap the location button. Online map display and optional public BRouter requests require internet; file editing does not.
+No account, analytics SDK, broad storage permission, or VeloGPX backend is used. Foreground location permission is requested only when you tap the location button. Online map display, optional public BRouter requests, and the explicit Open-Meteo terrain-elevation wand action require internet; other file editing does not.
 
 ## Install
 
-Download `VeloGPX-1.3.1.apk` from the latest GitHub Release and allow installation from your browser/files app. The release APK is signed with a development key for direct personal installation.
+Download `VeloGPX-1.4.0.apk` from the latest GitHub Release and allow installation from your browser/files app. The release APK is signed with a development key for direct personal installation.
 
 Android 8.0 (API 26) or newer is supported. The app targets Android 17/API 37.
 
@@ -49,7 +49,7 @@ Published releases use one protected, stable signing key so APK updates install 
 3. On **Map**, use Select, Line, Move, Split, or POI. Tap **Plan** for the dedicated route planner; it never chooses a hidden starting point.
 4. For merging, select two or more tracks, choose preserved gaps, direct lines, or bicycle-planned connections, then preview order, direction, output name, and source retention.
 5. In Split mode, tap the rendered track, add one or several cut markers, then split once or extract the span between exactly two markers.
-6. Open the wand button for cleaning, timestamp/elevation tools, daily-stage planning, and other transforms.
+6. Open the wand button for cleaning, timestamp/elevation tools, daily-stage planning, and other transforms. **Load terrain elevation** fills only missing values using Copernicus GLO-90 data via Open-Meteo; existing recorded elevations are retained.
 7. Tap anywhere on the bottom profile for an exact route cursor. The location button shows your position and, when nearby, its corresponding profile position.
 8. Undo/redo as needed, then export or open **Garmin** from Tracks.
 

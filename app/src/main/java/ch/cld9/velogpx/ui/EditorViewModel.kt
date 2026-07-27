@@ -33,6 +33,7 @@ import ch.cld9.velogpx.engine.TrackSelectionProfileEngine
 import ch.cld9.velogpx.engine.TrackDeduplicator
 import ch.cld9.velogpx.engine.TrackRangeEngine
 import ch.cld9.velogpx.engine.TrackStatistics
+import ch.cld9.velogpx.elevation.OpenMeteoElevationClient
 import ch.cld9.velogpx.io.GpxParser
 import ch.cld9.velogpx.io.GpxWriter
 import ch.cld9.velogpx.location.DeviceLocationTracker
@@ -53,6 +54,7 @@ import ch.cld9.velogpx.routing.RoutingOutcome
 import ch.cld9.velogpx.routing.RoutingRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -230,6 +232,7 @@ data class EditorUiState(
 class EditorViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = (application as VeloGpxApplication).projectRepository
     private val router = BRouterClient()
+    private val elevationClient = OpenMeteoElevationClient()
     private val undo = ArrayDeque<EditorHistoryState>()
     private val redo = ArrayDeque<EditorHistoryState>()
     private val parser = GpxParser()
@@ -240,6 +243,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     private var saveStatusJob: Job? = null
     private var routeJob: Job? = null
     private var joinJob: Job? = null
+    private var elevationJob: Job? = null
     private val pendingImports = mutableListOf<Uri>()
     private val _state = MutableStateFlow(EditorUiState())
     val state: StateFlow<EditorUiState> = _state.asStateFlow()
@@ -1078,6 +1082,47 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         replaceTrack(GpxOperations.interpolateMissingElevations(track), "Missing internal elevation samples interpolated.")
     }
 
+    fun loadTerrainElevation() {
+        val track = _state.value.selectedTrack ?: return
+        val missing = track.segments.sumOf { segment -> segment.points.count { it.elevation == null } }
+        if (missing == 0) {
+            _state.update { it.copy(message = "This track already has elevation for every point.") }
+            return
+        }
+        if (_state.value.busy) return
+        val sourceRevision = project?.documentRevision
+        elevationJob?.cancel()
+        _state.update { it.copy(busy = true, message = "Loading terrain elevation for $missing missing point${if (missing == 1) "" else "s"}…") }
+        elevationJob = viewModelScope.launch {
+            val result = try {
+                withContext(Dispatchers.Default) { elevationClient.fillMissing(track) }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                _state.update {
+                    it.copy(
+                        busy = false,
+                        message = "Could not load terrain elevation: ${error.message ?: "the elevation service is unavailable"}",
+                    )
+                }
+                return@launch
+            }
+            if (project?.documentRevision != sourceRevision || _state.value.document.tracks.none { it === track }) {
+                _state.update { it.copy(busy = false, message = "The track changed while elevation was loading; the downloaded values were discarded.") }
+                return@launch
+            }
+            val currentSelection = _state.value.selectedTrackId
+            val updatedTracks = _state.value.document.tracks.map { current -> if (current === track) result.track else current }
+            commit(
+                _state.value.document.copy(tracks = updatedTracks),
+                selectedTrackId = currentSelection,
+                message = "Added terrain elevation to ${result.filledPoints} point${if (result.filledPoints == 1) "" else "s"} " +
+                    "from ${result.requestedSamples} Copernicus DEM sample${if (result.requestedSamples == 1) "" else "s"} via Open-Meteo.",
+            )
+            _state.update { it.copy(busy = false) }
+        }
+    }
+
     fun shiftTime(minutes: Long) {
         val track = _state.value.selectedTrack ?: return
         replaceTrack(GpxOperations.shiftTime(track, Duration.ofMinutes(minutes)), "Track time shifted by $minutes minutes.")
@@ -1740,6 +1785,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     private suspend fun loadProject(result: ProjectOpenResult) {
         routeJob?.cancel()
         joinJob?.cancel()
+        elevationJob?.cancel()
         val closeError = runCatching { autosave?.close() }.exceptionOrNull()
         if (closeError != null) {
             _state.update { it.copy(loadingProject = false, message = "Could not save the current project: ${closeError.message}") }

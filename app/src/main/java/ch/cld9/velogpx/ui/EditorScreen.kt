@@ -351,6 +351,7 @@ fun EditorScreen(viewModel: EditorViewModel) {
         deduplicate = { viewModel.deduplicateSelected(); toolsOpen = false },
         clean = { viewModel.cleanSpeedSpikes(); toolsOpen = false },
         smooth = { viewModel.smoothElevation(); toolsOpen = false },
+        loadElevation = { viewModel.loadTerrainElevation(); toolsOpen = false },
         interpolate = { viewModel.interpolateElevation(); toolsOpen = false },
         time = { toolsOpen = false; timeDialog = true },
         stages = { toolsOpen = false; stagesDialog = true },
@@ -1059,6 +1060,7 @@ private fun TransformSheet(
     deduplicate: () -> Unit,
     clean: () -> Unit,
     smooth: () -> Unit,
+    loadElevation: () -> Unit,
     interpolate: () -> Unit,
     time: () -> Unit,
     stages: () -> Unit,
@@ -1079,7 +1081,13 @@ private fun TransformSheet(
             ToolRow("Remove duplicates", "Clean consecutive points within 20 cm", deduplicate, state.selectedTrack != null)
             ToolRow("Remove GPS spikes", "Remove implausible detours over 80 km/h", clean, state.selectedTrack != null)
             ToolRow("Smooth elevation", "Seven-point moving window", smooth, state.selectedTrack != null)
-            ToolRow("Fill missing elevation", "Distance-weighted interpolation between known samples", interpolate, state.selectedTrack != null)
+            ToolRow(
+                "Load terrain elevation",
+                "Fill missing values from Copernicus GLO-90 via Open-Meteo",
+                loadElevation,
+                state.selectedTrack?.segments?.any { segment -> segment.points.any { it.elevation == null } } == true,
+            )
+            ToolRow("Interpolate elevation gaps", "Fill internal gaps between known samples without network access", interpolate, state.selectedTrack != null)
             ToolRow("Time tools", "Generate, shift, or clear timestamps", time, state.selectedTrack != null)
             ToolRow("Plan daily stages", "Split into complete day tracks by target distance", stages, state.selectedTrack != null)
             if (state.selectedTrackIds.size > 1) {
