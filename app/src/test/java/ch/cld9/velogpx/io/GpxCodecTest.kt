@@ -129,6 +129,21 @@ class GpxCodecTest {
         assertEquals(9.0, bounds.maxLongitude, 0.0)
     }
 
+    @Test fun pointLimitIsEnforcedAsTracksAreParsed() {
+        val source = buildString {
+            append("<gpx xmlns=\"http://www.topografix.com/GPX/1/1\" version=\"1.1\" creator=\"test\">")
+            repeat(4) { index ->
+                append("<trk><trkseg><trkpt lat=\"${46 + index}.0\" lon=\"7.0\"/></trkseg></trk>")
+            }
+            append("</gpx>")
+        }
+
+        val result = GpxParser(GpxParser.Limits(maxPoints = 3)).parse(ByteArrayInputStream(source.toByteArray()))
+
+        assertNull(result.document)
+        assertTrue(result.issues.any { it.message.contains("Point limit") })
+    }
+
     @Test fun invalidCoordinatesAreRejected() {
         val result = GpxParser().parse(ByteArrayInputStream("<gpx version=\"1.1\"><wpt lat=\"91\" lon=\"8\"/></gpx>".toByteArray()))
         assertNull(result.document)

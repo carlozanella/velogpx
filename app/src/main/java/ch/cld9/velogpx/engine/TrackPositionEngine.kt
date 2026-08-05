@@ -40,35 +40,50 @@ data class TrackPosition(
 object TrackPositionEngine {
     private const val ENDPOINT_EPSILON = 1e-9
 
-    fun profile(track: GpxTrack): TrackProfile {
+    /**
+     * Builds a distance profile. `maximumSamples` only bounds retained chart samples; distances are
+     * still accumulated across every source edge, so the total remains exact. The default keeps the
+     * original full-precision behavior used by cursor/projection operations.
+     */
+    fun profile(track: GpxTrack, maximumSamples: Int = Int.MAX_VALUE): TrackProfile {
         var distance = 0.0
+        val pointCount = track.segments.sumOf { it.points.size }
+        val stride = if (maximumSamples >= pointCount || maximumSamples < 2) 1
+        else ((pointCount - 1 + maximumSamples - 2) / (maximumSamples - 1)).coerceAtLeast(1)
+        var sourceIndex = 0
         val runs = track.segments.mapIndexedNotNull { segmentIndex, segment ->
             if (segment.points.isEmpty()) return@mapIndexedNotNull null
-            segment.points.mapIndexed { pointIndex, point ->
+            segment.points.mapIndexedNotNull { pointIndex, point ->
                 if (pointIndex > 0) {
                     distance += GeoMath.distanceMeters(segment.points[pointIndex - 1], point)
                 }
-                TrackProfileSample(segmentIndex, pointIndex, point, distance)
+                val keep = pointIndex == 0 || pointIndex == segment.points.lastIndex || sourceIndex % stride == 0
+                sourceIndex++
+                if (keep) TrackProfileSample(segmentIndex, pointIndex, point, distance) else null
             }
         }
         return TrackProfile(runs, distance)
     }
 
     fun atSourcePoint(track: GpxTrack, segmentIndex: Int, pointIndex: Int): TrackPosition? {
-        val sample = profile(track).runs
-            .asSequence()
-            .flatten()
-            .firstOrNull { it.segmentIndex == segmentIndex && it.pointIndex == pointIndex }
-            ?: return null
+        val segment = track.segments.getOrNull(segmentIndex) ?: return null
+        val point = segment.points.getOrNull(pointIndex) ?: return null
+        var distance = 0.0
+        for (sourceSegmentIndex in 0..segmentIndex) {
+            val sourcePoints = track.segments[sourceSegmentIndex].points
+            val lastEdge = if (sourceSegmentIndex == segmentIndex) pointIndex else sourcePoints.lastIndex
+            for (index in 1..lastEdge) {
+                distance += GeoMath.distanceMeters(sourcePoints[index - 1], sourcePoints[index])
+            }
+        }
+        val edgeStart = pointIndex.coerceAtMost(segment.points.lastIndex.coerceAtLeast(0))
         return TrackPosition(
             trackId = track.id,
             segmentIndex = segmentIndex,
-            edgeStartPointIndex = pointIndex.coerceAtMost(
-                (track.segments.getOrNull(segmentIndex)?.points?.lastIndex ?: 0).coerceAtLeast(0),
-            ),
+            edgeStartPointIndex = edgeStart,
             fraction = 0.0,
-            point = sample.point,
-            distanceAlongMeters = sample.distanceMeters,
+            point = point,
+            distanceAlongMeters = distance,
             sourcePointIndex = pointIndex,
         )
     }

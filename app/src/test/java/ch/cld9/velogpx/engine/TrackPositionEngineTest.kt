@@ -7,6 +7,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Instant
 
@@ -28,6 +29,33 @@ class TrackPositionEngineTest {
             profile.totalDistanceMeters,
             0.001,
         )
+    }
+
+    @Test
+    fun `source point lookup retains distance from earlier segments`() {
+        val track = track(
+            listOf(point(46.0, 7.0), point(46.0, 7.01)),
+            listOf(point(46.0, 8.0), point(46.0, 8.01)),
+        )
+
+        val position = TrackPositionEngine.atSourcePoint(track, segmentIndex = 1, pointIndex = 1)!!
+        val expected = GeoMath.distanceMeters(track.segments[0].points[0], track.segments[0].points[1]) +
+            GeoMath.distanceMeters(track.segments[1].points[0], track.segments[1].points[1])
+
+        assertEquals(expected, position.distanceAlongMeters, 0.001)
+        assertSame(track.segments[1].points[1], position.point)
+    }
+
+    @Test
+    fun `bounded profile keeps exact total distance without retaining every point`() {
+        val points = (0..100).map { index -> point(46.0, 7.0 + index / 10_000.0) }
+        val track = track(points)
+
+        val full = TrackPositionEngine.profile(track)
+        val bounded = TrackPositionEngine.profile(track, maximumSamples = 10)
+
+        assertEquals(full.totalDistanceMeters, bounded.totalDistanceMeters, 0.001)
+        assertTrue(bounded.samples.size <= 10)
     }
 
     @Test

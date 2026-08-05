@@ -49,7 +49,9 @@ fun TrackProfileCard(
     positionDistanceMeters: ((TrackPosition) -> Double?)? = null,
     positionTrackName: ((String) -> String?)? = null,
 ) {
-    val profile = remember(track) { TrackPositionEngine.profile(track) }
+    // The chart is intentionally bounded for giant imported tracks. Distance accumulation remains
+    // exact; interactive cursor queries still use the full profile in the view model.
+    val profile = remember(track) { TrackPositionEngine.profile(track, MAX_PROFILE_SAMPLES) }
     val chartRuns = remember(profile) { profile.chartRuns(MAX_CHART_SAMPLES) }
     val density = LocalDensity.current
     val leftInset = 38.dp
@@ -199,6 +201,7 @@ private fun formatProfileDistance(meters: Double): String = when {
 
 private val PROFILE_TIME = DateTimeFormatter.ofPattern("d MMM HH:mm")
 private const val MAX_CHART_SAMPLES = 3_000
+private const val MAX_PROFILE_SAMPLES = 50_000
 
 /** Bounds chart cost for very large imports while preserving local high and low points. */
 private fun TrackProfile.chartRuns(maximumSamples: Int): List<List<TrackProfileSample>> {

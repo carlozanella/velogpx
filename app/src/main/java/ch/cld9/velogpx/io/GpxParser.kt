@@ -85,6 +85,7 @@ class GpxParser(
             val routes = mutableListOf<GpxRoute>()
             val tracks = mutableListOf<GpxTrack>()
             val rootExtensions = mutableListOf<XmlElement>()
+            var pointCount = 0
 
             if (version == GpxVersion.V1_0) metadata = parseMetadata10(root, issues)
             for (child in root.elementChildren()) {
@@ -94,15 +95,24 @@ class GpxParser(
                 }
                 when (child.localNameOrNode()) {
                     "metadata" -> metadata = parseMetadata11(child, issues)
-                    "wpt" -> waypoints += parsePoint(child, issues, "/gpx/wpt")
-                    "rte" -> routes += parseRoute(child, issues)
-                    "trk" -> tracks += parseTrack(child, issues)
+                    "wpt" -> {
+                        waypoints += parsePoint(child, issues, "/gpx/wpt")
+                        pointCount++
+                    }
+                    "rte" -> {
+                        val route = parseRoute(child, issues)
+                        routes += route
+                        pointCount += route.points.size
+                    }
+                    "trk" -> {
+                        val track = parseTrack(child, issues)
+                        tracks += track
+                        pointCount += track.segments.sumOf { it.points.size }
+                    }
                     "extensions" -> rootExtensions += parseExtensionContainer(child, 0)
                     "name", "desc", "author", "email", "url", "urlname", "time", "keywords", "bounds" -> Unit
                     else -> rootExtensions += elementToXml(child, 0)
                 }
-                val pointCount = waypoints.size + routes.sumOf { it.points.size } +
-                    tracks.sumOf { track -> track.segments.sumOf { it.points.size } }
                 if (pointCount > limits.maxPoints) error("Point limit of ${limits.maxPoints} exceeded")
             }
 

@@ -136,6 +136,10 @@ import kotlin.math.roundToInt
 @Composable
 fun EditorScreen(viewModel: EditorViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    // A document's point count is immutable for the lifetime of this document instance. Keep the
+    // derived value out of every unrelated state recomposition (project list/save-status updates
+    // otherwise rescan every point in a large project on the main thread).
+    val documentPointCount = remember(state.document) { state.document.pointCount }
     val selectionProfile by produceState<TrackSelectionProfile?>(
         null,
         state.document.tracks,
@@ -223,7 +227,7 @@ fun EditorScreen(viewModel: EditorViewModel) {
                     Column {
                         Text(state.projectTitle, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(
-                            "${state.document.tracks.size} tracks · ${state.document.pointCount} points · ${saveStatusLabel(state.saveStatus)}",
+                            "${state.document.tracks.size} tracks · $documentPointCount points · ${saveStatusLabel(state.saveStatus)}",
                             style = MaterialTheme.typography.labelSmall,
                         )
                     }
@@ -332,7 +336,12 @@ fun EditorScreen(viewModel: EditorViewModel) {
                 ) {
                     Row(Modifier.padding(horizontal = 18.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                         CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
-                        Spacer(Modifier.width(12.dp)); Text(if (state.loadingProject) "Opening project…" else "Working…")
+                        Spacer(Modifier.width(12.dp))
+                        Text(if (state.loadingProject) "Opening project…" else "Working…")
+                        if (state.loadingProject) {
+                            Spacer(Modifier.width(8.dp))
+                            TextButton(onClick = viewModel::cancelProjectOpening) { Text("Cancel") }
+                        }
                     }
                 }
             }

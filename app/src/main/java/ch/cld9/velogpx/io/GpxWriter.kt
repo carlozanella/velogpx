@@ -42,16 +42,7 @@ class GpxWriter {
         writer.append(">\n")
 
         document.metadata?.let { sourceMetadata ->
-            val points = document.waypoints + document.routes.flatMap { it.points } +
-                document.tracks.flatMap { track -> track.segments.flatMap { it.points } }
-            val metadata = if (points.isEmpty()) sourceMetadata else sourceMetadata.copy(
-                bounds = ch.cld9.velogpx.model.GpxBounds(
-                    minLatitude = points.minOf { it.latitude },
-                    minLongitude = points.minOf { it.longitude },
-                    maxLatitude = points.maxOf { it.latitude },
-                    maxLongitude = points.maxOf { it.longitude },
-                ),
-            )
+            val metadata = document.pointBounds()?.let { bounds -> sourceMetadata.copy(bounds = bounds) } ?: sourceMetadata
             if (version == GpxVersion.V1_1) writeMetadata11(writer, metadata, 1)
             else writeMetadata10(writer, metadata, 1)
         }
@@ -61,6 +52,31 @@ class GpxWriter {
         writeExtensions(writer, document.rootExtensions, version, 1)
         writer.append("</gpx>\n")
         writer.flush()
+    }
+
+    /** Computes export bounds without allocating a second list containing every geometry point. */
+    private fun GpxDocument.pointBounds(): ch.cld9.velogpx.model.GpxBounds? {
+        var count = 0
+        var minLatitude = Double.POSITIVE_INFINITY
+        var minLongitude = Double.POSITIVE_INFINITY
+        var maxLatitude = Double.NEGATIVE_INFINITY
+        var maxLongitude = Double.NEGATIVE_INFINITY
+        fun visit(point: GpxPoint) {
+            count++
+            minLatitude = minOf(minLatitude, point.latitude)
+            minLongitude = minOf(minLongitude, point.longitude)
+            maxLatitude = maxOf(maxLatitude, point.latitude)
+            maxLongitude = maxOf(maxLongitude, point.longitude)
+        }
+        waypoints.forEach(::visit)
+        routes.forEach { route -> route.points.forEach(::visit) }
+        tracks.forEach { track -> track.segments.forEach { segment -> segment.points.forEach(::visit) } }
+        return if (count == 0) null else ch.cld9.velogpx.model.GpxBounds(
+            minLatitude = minLatitude,
+            minLongitude = minLongitude,
+            maxLatitude = maxLatitude,
+            maxLongitude = maxLongitude,
+        )
     }
 
     private fun writeMetadata11(writer: Appendable, value: GpxMetadata, depth: Int) {

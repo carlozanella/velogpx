@@ -22,7 +22,7 @@ No account, analytics SDK, broad storage permission, or VeloGPX backend is used.
 
 ## Install
 
-Download `VeloGPX-1.4.0.apk` from the latest GitHub Release and allow installation from your browser/files app. The release APK is signed with a development key for direct personal installation.
+Download `VeloGPX-1.4.1.apk` from the latest GitHub Release and allow installation from your browser/files app. The release APK is signed with a development key for direct personal installation.
 
 Android 8.0 (API 26) or newer is supported. The app targets Android 17/API 37.
 

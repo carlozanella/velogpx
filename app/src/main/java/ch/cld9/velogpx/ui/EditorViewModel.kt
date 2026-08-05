@@ -244,6 +244,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     private var routeJob: Job? = null
     private var joinJob: Job? = null
     private var elevationJob: Job? = null
+    private var projectOpenJob: Job? = null
     private val pendingImports = mutableListOf<Uri>()
     private val _state = MutableStateFlow(EditorUiState())
     val state: StateFlow<EditorUiState> = _state.asStateFlow()
@@ -258,10 +259,11 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     init {
-        viewModelScope.launch {
+        projectOpenJob = viewModelScope.launch {
             runCatching { repository.openLastOrCreate() }
                 .onSuccess { loadProject(it) }
                 .onFailure { error ->
+                    if (error is CancellationException) return@onFailure
                     _state.update { it.copy(loadingProject = false, message = "Could not open projects: ${error.message}") }
                 }
         }
@@ -750,12 +752,25 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     fun openProject(projectId: String) {
         if (projectId == _state.value.projectId) return
-        viewModelScope.launch {
+        projectOpenJob?.cancel()
+        projectOpenJob = viewModelScope.launch {
             _state.update { it.copy(loadingProject = true) }
             runCatching { repository.open(projectId) }
                 .onSuccess { loadProject(it) }
-                .onFailure { error -> _state.update { it.copy(loadingProject = false, message = "Could not open project: ${error.message}") } }
+                .onFailure { error ->
+                    if (error is CancellationException) return@onFailure
+                    _state.update { it.copy(loadingProject = false, message = "Could not open project: ${error.message}") }
+                }
         }
+    }
+
+    /** Lets the user recover the editor shell when a very large/corrupt archive takes too long. */
+    fun cancelProjectOpening() {
+        if (!_state.value.loadingProject) return
+        projectOpenJob?.cancel()
+        projectOpenJob = null
+        _state.update { it.copy(loadingProject = false, message = "Project opening cancelled.") }
+        viewModelScope.launch { refreshProjects() }
     }
 
     fun renameProject(title: String) {

@@ -41,24 +41,38 @@ class ProjectRepository private constructor(
     private val _catalog = MutableStateFlow(ProjectCatalog())
     val catalog: StateFlow<ProjectCatalog> = _catalog.asStateFlow()
 
-    suspend fun openLastOrCreate(): ProjectOpenResult = ioLocked {
-        ensureDirectories()
-        var catalog = reconcile(readCatalog())
-        var legacyResult: ProjectOpenResult? = null
-        if (catalog.projects.isEmpty() && legacyAutosave.isFile) {
-            legacyResult = migrateLegacyLocked()
-            if (legacyResult != null) catalog = reconcile(readCatalog())
+    suspend fun openLastOrCreate(): ProjectOpenResult = withContext(dispatcher) {
+        // Catalog reconciliation and writes are serialized, but parsing the selected archive is
+        // deliberately outside the repository mutex. A large GPX must not block project-list
+        // reads (or a user cancelling the opening screen) for the entire XML parse.
+        val selection = mutex.withLock {
+            ensureDirectories()
+            var catalog = reconcile(readCatalog())
+            var legacyResult: ProjectOpenResult? = null
+            if (catalog.projects.isEmpty() && legacyAutosave.isFile) {
+                legacyResult = migrateLegacyLocked()
+                if (legacyResult != null) catalog = reconcile(readCatalog())
+            }
+            if (catalog.projects.isEmpty()) {
+                val created = createLocked(
+                    "Untitled bicycle tour",
+                    GpxDocument(metadata = GpxMetadata(name = "Untitled bicycle tour")),
+                )
+                return@withLock ProjectOpenSelection.Result(ProjectOpenResult(created, ProjectRecoverySource.NEW_PROJECT))
+            }
+            legacyResult?.let { return@withLock ProjectOpenSelection.Result(it) }
+            val targetId = catalog.lastProjectId?.takeIf { id -> catalog.projects.any { it.id == id } }
+                ?: catalog.projects.maxByOrNull(ProjectSummary::lastOpenedAt)?.id
+                ?: error("Project catalog has no usable project")
+            ProjectOpenSelection.Id(targetId)
         }
-        if (catalog.projects.isEmpty()) {
-            val created = createLocked("Untitled bicycle tour", GpxDocument(metadata = GpxMetadata(name = "Untitled bicycle tour")))
-            catalog = readCatalog()
-            return@ioLocked ProjectOpenResult(created, ProjectRecoverySource.NEW_PROJECT)
+        when (selection) {
+            is ProjectOpenSelection.Result -> selection.value
+            is ProjectOpenSelection.Id -> {
+                val stored = fileStore.read(selection.value)
+                mutex.withLock { openStoredLocked(selection.value, stored) }
+            }
         }
-        legacyResult?.let { return@ioLocked it }
-        val targetId = catalog.lastProjectId?.takeIf { id -> catalog.projects.any { it.id == id } }
-            ?: catalog.projects.maxByOrNull(ProjectSummary::lastOpenedAt)?.id
-            ?: error("Project catalog has no usable project")
-        openLocked(targetId)
     }
 
     suspend fun listProjects(): List<ProjectSummary> = ioLocked {
@@ -71,7 +85,13 @@ class ProjectRepository private constructor(
         document: GpxDocument = GpxDocument(metadata = GpxMetadata(name = title)),
     ): ProjectState = ioLocked { createLocked(title, document) }
 
-    suspend fun open(projectId: String): ProjectOpenResult = ioLocked { openLocked(projectId) }
+    suspend fun open(projectId: String): ProjectOpenResult = withContext(dispatcher) {
+        // Reads are safe outside the lock because project writes use atomic replacement. Keeping
+        // the expensive archive parse out of the lock also leaves catalog/recovery operations
+        // responsive while a large project is being opened.
+        val stored = fileStore.read(projectId)
+        mutex.withLock { openStoredLocked(projectId, stored) }
+    }
 
     suspend fun save(project: ProjectState, snapshotPolicy: SnapshotPolicy = SnapshotPolicy.AUTOMATIC): ProjectState = ioLocked {
         saveLocked(project, snapshotPolicy)
@@ -142,8 +162,7 @@ class ProjectRepository private constructor(
     internal fun registerAutosave(session: ProjectAutosaveSession) { autosaves += session }
     internal fun unregisterAutosave(session: ProjectAutosaveSession) { autosaves -= session }
 
-    private fun openLocked(projectId: String): ProjectOpenResult {
-        val stored = fileStore.read(projectId)
+    private fun openStoredLocked(projectId: String, stored: StoredProjectResult): ProjectOpenResult {
         val now = clock.now()
         val catalog = reconcile(readCatalog())
         writeCatalog(catalog.copy(
@@ -233,3 +252,8 @@ class ProjectRepository private constructor(
 private fun ProjectCatalog.withSummary(summary: ProjectSummary) = copy(
     projects = projects.filterNot { it.id == summary.id } + summary,
 )
+
+private sealed interface ProjectOpenSelection {
+    data class Id(val value: String) : ProjectOpenSelection
+    data class Result(val value: ProjectOpenResult) : ProjectOpenSelection
+}

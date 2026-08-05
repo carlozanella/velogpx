@@ -106,6 +106,14 @@ private data class MapPayload(
     val draftAnchors: List<ModelPoint>,
 )
 
+private fun documentPoints(document: GpxDocument): Sequence<ModelPoint> = sequence {
+    document.waypoints.forEach { yield(it) }
+    document.routes.forEach { route -> route.points.forEach { yield(it) } }
+    document.tracks.forEach { track ->
+        track.segments.forEach { segment -> segment.points.forEach { yield(it) } }
+    }
+}
+
 @Composable
 fun MapEditor(
     document: GpxDocument,
@@ -289,7 +297,7 @@ private class MapRenderer {
             val collection = if (geometryChanged) {
                 FeatureCollection.fromFeatures(track.segments.mapNotNull { segment ->
                     segment.points.takeIf { it.size >= 2 }?.let { points ->
-                        Feature.fromGeometry(LineString.fromLngLats(points.map { Point.fromLngLat(it.longitude, it.latitude) })).apply {
+                        Feature.fromGeometry(LineString.fromLngLats(renderPoints(points).map { Point.fromLngLat(it.longitude, it.latitude) })).apply {
                             addStringProperty("trackId", track.id)
                         }
                     }
@@ -324,7 +332,7 @@ private class MapRenderer {
         payload.document.routes.forEach { route ->
             val key = "route-${route.id}"
             val feature = route.points.takeIf { it.size >= 2 }?.let { points ->
-                FeatureCollection.fromFeature(Feature.fromGeometry(LineString.fromLngLats(points.map { Point.fromLngLat(it.longitude, it.latitude) })))
+                FeatureCollection.fromFeature(Feature.fromGeometry(LineString.fromLngLats(renderPoints(points).map { Point.fromLngLat(it.longitude, it.latitude) })))
             } ?: FeatureCollection.fromFeatures(emptyList())
             val source = style.getSourceAs<GeoJsonSource>(sourceId(key))
             if (source == null) { style.addSource(GeoJsonSource(sourceId(key), feature)); trackIds += key } else source.setGeoJson(feature)
@@ -357,16 +365,14 @@ private class MapRenderer {
                 ),
             )
         } else {
-            val points = document.tracks.flatMap { it.segments }.flatMap { it.points } +
-                document.routes.flatMap { it.points } + document.waypoints
-            fitPoints(map, points, animate = false, mapView = mapView)
+            fitPoints(map, documentPoints(document), animate = false, mapView = mapView)
         }
     }
 
     fun focus(map: MapLibreMap, request: MapFocusRequest, mapView: MapView) {
         if (request.token == lastFocusToken) return
         lastFocusToken = request.token
-        fitPoints(map, request.points, animate = true, mapView = mapView, bottomInsetDp = request.bottomInsetDp)
+        fitPoints(map, request.points.asSequence(), animate = true, mapView = mapView, bottomInsetDp = request.bottomInsetDp)
     }
 
     fun trackIdsAt(map: MapLibreMap, location: LatLng, corridor: Float): List<String> {
@@ -529,12 +535,11 @@ private class MapRenderer {
 
     private fun fitPoints(
         map: MapLibreMap,
-        points: List<ModelPoint>,
+        points: Sequence<ModelPoint>,
         animate: Boolean,
         mapView: MapView,
         bottomInsetDp: Float = 0f,
     ) {
-        if (points.isEmpty()) return
         val width = mapView.width.takeIf { it > 0 } ?: mapView.resources.displayMetrics.widthPixels
         val height = mapView.height.takeIf { it > 0 } ?: mapView.resources.displayMetrics.heightPixels
         val padding = 72.0 * mapView.resources.displayMetrics.density
@@ -542,10 +547,20 @@ private class MapRenderer {
         val bottomInset = bottomInsetDp * mapView.resources.displayMetrics.density
         val usableHeight = (height - 2.0 * padding - bottomInset).coerceAtLeast(64.0)
 
-        val xs = points.map { point ->
+        val xs = ArrayList<Double>()
+        var minimumY = Double.POSITIVE_INFINITY
+        var maximumY = Double.NEGATIVE_INFINITY
+        points.forEach { point ->
             val raw = (point.longitude + 180.0) / 360.0
-            ((raw % 1.0) + 1.0) % 1.0
-        }.sorted()
+            xs += ((raw % 1.0) + 1.0) % 1.0
+            val latitude = point.latitude.coerceIn(-85.05112878, 85.05112878)
+            val radians = Math.toRadians(latitude)
+            val y = (1.0 - ln(tan(radians) + 1.0 / kotlin.math.cos(radians)) / PI) / 2.0
+            minimumY = minOf(minimumY, y)
+            maximumY = maxOf(maximumY, y)
+        }
+        if (xs.isEmpty()) return
+        xs.sort()
         var largestGap = -1.0
         var intervalStart = xs.first()
         xs.indices.forEach { index ->
@@ -559,13 +574,6 @@ private class MapRenderer {
         val spanX = (1.0 - largestGap).coerceAtLeast(0.0)
         val centerX = (intervalStart + spanX / 2.0) % 1.0
 
-        val ys = points.map { point ->
-            val latitude = point.latitude.coerceIn(-85.05112878, 85.05112878)
-            val radians = Math.toRadians(latitude)
-            (1.0 - ln(tan(radians) + 1.0 / kotlin.math.cos(radians)) / PI) / 2.0
-        }
-        val minimumY = ys.min()
-        val maximumY = ys.max()
         val spanY = maximumY - minimumY
         val zoomX = if (spanX < 1e-12) 18.0 else log2(usableWidth / (256.0 * spanX))
         val zoomY = if (spanY < 1e-12) 18.0 else log2(usableHeight / (256.0 * spanY))
@@ -583,6 +591,29 @@ private class MapRenderer {
     private fun layerId(id: String) = "velogpx-layer-$id"
     private fun haloLayerId(id: String) = "velogpx-halo-$id"
     private fun colorString(argb: Long) = String.format("#%06X", argb and 0xFFFFFF)
+
+    /**
+     * Keep the full immutable geometry in the model/export, but bound the native MapLibre payload.
+     * Very large imported tracks otherwise allocate one native GeoJSON point per source point and
+     * can make opening the project look hung (or exhaust the app heap) before the first frame.
+     */
+    private fun renderPoints(points: List<ModelPoint>): List<ModelPoint> {
+        if (points.size <= MAX_RENDER_POINTS_PER_SEGMENT) return points
+        val stride = ((points.lastIndex + MAX_RENDER_POINTS_PER_SEGMENT - 2) /
+            (MAX_RENDER_POINTS_PER_SEGMENT - 1)).coerceAtLeast(1)
+        return buildList(MAX_RENDER_POINTS_PER_SEGMENT) {
+            var index = 0
+            while (index < points.lastIndex) {
+                add(points[index])
+                index += stride
+            }
+            add(points.last())
+        }
+    }
+
+    private companion object {
+        const val MAX_RENDER_POINTS_PER_SEGMENT = 20_000
+    }
 }
 
 internal class LassoOverlayView(context: Context) : View(context) {

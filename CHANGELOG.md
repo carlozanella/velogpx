@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.1 — 2026-08-05
+
+- Fixed large projects appearing to hang during automatic opening by parsing archives outside the catalog lock and avoiding repeated full-point scans.
+- Bounded MapLibre/profile rendering allocations for very large tracks while retaining full geometry for editing and export.
+- Added a Cancel action to leave a slow or damaged project opening screen without clearing local project data.
+
 ## 1.4.0 — 2026-07-27
 
 - Added a **Load terrain elevation** wand action that fills only missing values from the worldwide 90 m Copernicus DEM via Open-Meteo, with bounded batching, cancellation, stale-result protection, attribution, and one-step undo.

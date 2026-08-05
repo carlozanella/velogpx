@@ -155,8 +155,13 @@ data class GpxDocument(
     val namespaceDeclarations: Map<String, String> = emptyMap(),
     val sourceName: String? = null,
 ) {
-    val pointCount: Int get() = waypoints.size + routes.sumOf { it.points.size } +
-        tracks.sumOf { track -> track.segments.sumOf { it.points.size } }
+    // A loaded document is immutable. Cache this frequently displayed aggregate so unrelated UI
+    // recompositions and catalog writes do not walk every point again.
+    private val cachedPointCount: Lazy<Int> = lazy(LazyThreadSafetyMode.NONE) {
+        waypoints.size + routes.sumOf { it.points.size } +
+            tracks.sumOf { track -> track.segments.sumOf { it.points.size } }
+    }
+    val pointCount: Int get() = cachedPointCount.value
     val isEmpty: Boolean get() = waypoints.isEmpty() && routes.isEmpty() && tracks.isEmpty()
 }
 
@@ -181,4 +186,3 @@ data class TrackStyle(
     val visible: Boolean = true,
     val widthDp: Float = 5f,
 )
-
