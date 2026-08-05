@@ -16,6 +16,7 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.io.FileOutputStream
+import java.io.ByteArrayOutputStream
 import java.time.Instant
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
@@ -140,6 +141,19 @@ class ProjectArchiveCodecTest {
 
         assertNull(loaded.editor.selectedTrackId)
         assertEquals(emptyList<String>(), loaded.editor.selectedTrackIds)
+    }
+
+    @Test fun writerNeverCreatesAnArchiveItsConfiguredReaderWouldReject() {
+        val points = (0 until 100).map { index -> GpxPoint(47.0, 8.0 + index / 100_000.0) }
+        val project = ProjectState.create(
+            title = "Too large",
+            document = GpxDocument(tracks = listOf(GpxTrack(segments = listOf(GpxTrackSegment(points))))),
+            now = Instant.EPOCH,
+        )
+
+        assertThrows(ProjectFormatException::class.java) {
+            ProjectArchiveCodec(maximumGpxBytes = 512).write(project, ByteArrayOutputStream())
+        }
     }
 
     private fun rewriteManifest(source: File, target: File, transform: (JSONObject) -> JSONObject) {

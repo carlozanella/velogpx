@@ -4,6 +4,7 @@ import java.io.File
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.CancellationException
 
 fun interface ProjectClock { fun now(): Instant }
 
@@ -48,11 +49,14 @@ class ProjectFileStore(
                 atomicFiles.prepareRead(current)
                 codec.read(current)
             }
+            currentResult.exceptionOrNull()?.let { if (it is CancellationException) throw it }
             currentResult.getOrNull()?.let { return StoredProjectResult(it, ProjectRecoverySource.CURRENT) }
             quarantine(current)
             val warning = currentResult.exceptionOrNull()?.message ?: "The current project archive is damaged"
             newestSnapshots(projectId).forEach { snapshot ->
-                runCatching { codec.read(snapshot) }.getOrNull()?.let { recovered ->
+                val snapshotResult = runCatching { codec.read(snapshot) }
+                snapshotResult.exceptionOrNull()?.let { if (it is CancellationException) throw it }
+                snapshotResult.getOrNull()?.let { recovered ->
                     atomicFiles.copy(snapshot, current)
                     return StoredProjectResult(
                         recovered,
@@ -64,7 +68,9 @@ class ProjectFileStore(
             throw ProjectFormatException("No valid recovery snapshot exists for project $projectId: $warning")
         }
         newestSnapshots(projectId).forEach { snapshot ->
-            runCatching { codec.read(snapshot) }.getOrNull()?.let { recovered ->
+            val snapshotResult = runCatching { codec.read(snapshot) }
+            snapshotResult.exceptionOrNull()?.let { if (it is CancellationException) throw it }
+            snapshotResult.getOrNull()?.let { recovered ->
                 atomicFiles.copy(snapshot, current)
                 return StoredProjectResult(recovered, ProjectRecoverySource.SNAPSHOT, listOf("Recovered a missing project archive from a snapshot."))
             }

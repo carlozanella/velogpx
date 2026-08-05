@@ -7,10 +7,12 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.CancellationException
 
 class GpxCodecTest {
     @Test fun gpx11RoundTripPreservesHierarchyAndExtensionTree() {
@@ -142,6 +144,35 @@ class GpxCodecTest {
 
         assertNull(result.document)
         assertTrue(result.issues.any { it.message.contains("Point limit") })
+    }
+
+    @Test fun interruptedParsingPropagatesCancellation() {
+        Thread.currentThread().interrupt()
+        try {
+            assertThrows(CancellationException::class.java) {
+                GpxParser().parse(ByteArrayInputStream("<gpx version=\"1.1\"/>".toByteArray()))
+            }
+        } finally {
+            Thread.interrupted()
+        }
+    }
+
+    @Test fun denseProjectParsesWithoutPerPointIdentityBottleneck() {
+        val source = buildString(4_000_000) {
+            append("<gpx xmlns=\"http://www.topografix.com/GPX/1/1\" version=\"1.1\" creator=\"test\"><trk><trkseg>")
+            repeat(50_000) { index ->
+                append("<trkpt lat=\"47.0\" lon=\"")
+                append(8.0 + index / 1_000_000.0)
+                append("\"><ele>500</ele></trkpt>")
+            }
+            append("</trkseg></trk></gpx>")
+        }
+
+        val document = GpxParser().parse(ByteArrayInputStream(source.toByteArray())).document!!
+
+        assertEquals(50_000, document.pointCount)
+        val points = document.tracks.single().segments.single().points
+        assertEquals(points.size, points.map { it.id }.toSet().size)
     }
 
     @Test fun invalidCoordinatesAreRejected() {

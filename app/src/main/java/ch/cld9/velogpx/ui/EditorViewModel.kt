@@ -259,6 +259,12 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     init {
+        viewModelScope.launch {
+            repository.catalog.collectLatest { catalog ->
+                _state.update { it.copy(projects = catalog.projects.sortedByDescending(ProjectSummary::lastOpenedAt)) }
+            }
+        }
+        viewModelScope.launch { refreshProjects() }
         projectOpenJob = viewModelScope.launch {
             runCatching { repository.openLastOrCreate() }
                 .onSuccess { loadProject(it) }
@@ -743,6 +749,8 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun newProject(title: String = "Untitled bicycle tour") {
+        projectOpenJob?.cancel()
+        projectOpenJob = null
         viewModelScope.launch {
             runCatching { repository.create(title.trim().ifBlank { "Untitled bicycle tour" }) }
                 .onSuccess { loadProject(ProjectOpenResult(it, ProjectRecoverySource.NEW_PROJECT)) }
@@ -1812,43 +1820,47 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         val opened = result.project
         val liveLocation = _state.value.currentLocation
         val trackingLocation = _state.value.locationTracking
+        val loadedState = withContext(Dispatchers.Default) {
+            val editor = opened.editor
+            val document = reorderTracks(opened.document, editor.layerOrder)
+            val trackIds = document.tracks.mapTo(hashSetOf(), GpxTrack::id)
+            val selectedIds = editor.selectedTrackIds.filterTo(linkedSetOf()) { it in trackIds }
+            val selected = editor.selectedTrackId?.takeIf { it in trackIds }
+            val restoredSelection = editor.selectedPoint?.let { PointSelection(it.trackId, it.segmentIndex, it.pointIndex) }
+            val restoredCursor = restoredSelection?.let { selection ->
+                document.tracks.firstOrNull { it.id == selection.trackId }
+                    ?.let { TrackPositionEngine.atSourcePoint(it, selection.segmentIndex, selection.pointIndex) }
+                    ?.let { TrackCursor(it, TrackCursorSource.RECORDED_POINT) }
+            }
+            EditorUiState(
+                document = document,
+                styles = stylesFor(document.tracks, editor.styles),
+                selectedTrackId = selected,
+                selectedTrackIds = selectedIds.ifEmpty { setOfNotNull(selected) },
+                selectionMode = selectedIds.size > 1,
+                selectedPoint = restoredSelection,
+                selectedCursor = restoredCursor,
+                panel = runCatching { EditorPanel.valueOf(editor.panelId) }.getOrDefault(EditorPanel.MAP),
+                bicycleProfile = BicycleProfile.entries.firstOrNull { it.id == editor.routingProfileId } ?: BicycleProfile.TOURING,
+                dirty = opened.isDocumentDirty,
+                recoveredAutosave = result.source == ProjectRecoverySource.SNAPSHOT || result.source == ProjectRecoverySource.LEGACY_AUTOSAVE,
+                loadingProject = false,
+                projectId = opened.id,
+                projectTitle = opened.title,
+                saveStatus = ProjectSaveStatus.Saved(opened.revision),
+                groups = normalizeTrackGroups(document.tracks.map(GpxTrack::id), editor.groups),
+                camera = editor.camera?.let { MapCameraState(it.latitude, it.longitude, it.zoom, it.bearing, it.pitch) },
+                message = result.warnings.firstOrNull(),
+                layersScrollIndex = editor.layersScrollIndex,
+                layersScrollOffset = editor.layersScrollOffset,
+                currentLocation = liveLocation,
+                locationTracking = trackingLocation,
+            )
+        }
         project = opened
         val session = repository.autosaveSession(opened, viewModelScope)
         autosave = session
-        val editor = opened.editor
-        val document = reorderTracks(opened.document, editor.layerOrder)
-        val selectedIds = editor.selectedTrackIds.filterTo(linkedSetOf()) { id -> document.tracks.any { it.id == id } }
-        val selected = editor.selectedTrackId?.takeIf { id -> document.tracks.any { it.id == id } }
-        val restoredSelection = editor.selectedPoint?.let { PointSelection(it.trackId, it.segmentIndex, it.pointIndex) }
-        val restoredCursor = restoredSelection?.let { selection ->
-            document.tracks.firstOrNull { it.id == selection.trackId }
-                ?.let { TrackPositionEngine.atSourcePoint(it, selection.segmentIndex, selection.pointIndex) }
-                ?.let { TrackCursor(it, TrackCursorSource.RECORDED_POINT) }
-        }
-        _state.value = EditorUiState(
-            document = document,
-            styles = stylesFor(document.tracks, editor.styles),
-            selectedTrackId = selected,
-            selectedTrackIds = selectedIds.ifEmpty { setOfNotNull(selected) },
-            selectionMode = selectedIds.size > 1,
-            selectedPoint = restoredSelection,
-            selectedCursor = restoredCursor,
-            panel = runCatching { EditorPanel.valueOf(editor.panelId) }.getOrDefault(EditorPanel.MAP),
-            bicycleProfile = BicycleProfile.entries.firstOrNull { it.id == editor.routingProfileId } ?: BicycleProfile.TOURING,
-            dirty = opened.isDocumentDirty,
-            recoveredAutosave = result.source == ProjectRecoverySource.SNAPSHOT || result.source == ProjectRecoverySource.LEGACY_AUTOSAVE,
-            loadingProject = false,
-            projectId = opened.id,
-            projectTitle = opened.title,
-            saveStatus = ProjectSaveStatus.Saved(opened.revision),
-            groups = normalizeTrackGroups(document.tracks.map(GpxTrack::id), editor.groups),
-            camera = editor.camera?.let { MapCameraState(it.latitude, it.longitude, it.zoom, it.bearing, it.pitch) },
-            message = result.warnings.firstOrNull(),
-            layersScrollIndex = editor.layersScrollIndex,
-            layersScrollOffset = editor.layersScrollOffset,
-            currentLocation = liveLocation,
-            locationTracking = trackingLocation,
-        )
+        _state.value = loadedState
         refreshCurrentLocationProjection()
         saveStatusJob = viewModelScope.launch {
             session.status.collectLatest { status -> _state.update { it.copy(saveStatus = status) } }

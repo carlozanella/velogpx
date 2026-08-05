@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.2 — 2026-08-06
+
+- Made project cancellation actually interrupt archive parsing; opening or creating another project can no longer leave hidden parsers consuming CPU and memory.
+- Made dense project parsing substantially faster by indexing GPX point fields once and avoiding a cryptographic UUID generation for every coordinate.
+- Kept the project list live while a document opens and moved project-state preparation off the UI thread.
+- Bounded total MapLibre geometry, cached route geometry, and avoided full-document camera scans so large and fragmented projects reach the editor promptly.
+- Raised the internal project GPX ceiling from 32 MiB to 256 MiB and made saves obey the same ceiling used by reopening, preserving compatibility with large existing archives.
+
 ## 1.4.1 — 2026-08-05
 
 - Fixed large projects appearing to hang during automatic opening by parsing archives outside the catalog lock and avoiding repeated full-point scans.

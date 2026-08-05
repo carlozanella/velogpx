@@ -106,13 +106,33 @@ private data class MapPayload(
     val draftAnchors: List<ModelPoint>,
 )
 
-private fun documentPoints(document: GpxDocument): Sequence<ModelPoint> = sequence {
-    document.waypoints.forEach { yield(it) }
-    document.routes.forEach { route -> route.points.forEach { yield(it) } }
-    document.tracks.forEach { track ->
-        track.segments.forEach { segment -> segment.points.forEach { yield(it) } }
+private fun documentOverviewPoints(document: GpxDocument): Sequence<ModelPoint> = sequence {
+    val bounds = document.metadata?.bounds
+    if (bounds != null) {
+        yield(ModelPoint(bounds.minLatitude, bounds.minLongitude))
+        yield(ModelPoint(bounds.maxLatitude, bounds.maxLongitude))
+        return@sequence
+    }
+    document.waypoints.take(MAX_OVERVIEW_FEATURES).forEach { yield(it) }
+    document.routes.take(MAX_OVERVIEW_FEATURES).forEach { route ->
+        route.points.firstOrNull()?.let { yield(it) }
+        route.points.lastOrNull()?.takeUnless { it === route.points.firstOrNull() }?.let { yield(it) }
+    }
+    document.tracks.take(MAX_OVERVIEW_FEATURES).forEach { track ->
+        track.segments.take(MAX_OVERVIEW_FEATURES).forEach { segment ->
+            segment.points.firstOrNull()?.let { yield(it) }
+            segment.points.lastOrNull()?.takeUnless { it === segment.points.firstOrNull() }?.let { yield(it) }
+        }
     }
 }
+
+private const val MAX_OVERVIEW_FEATURES = 10_000
+
+private data class CachedMapGeometry(
+    val model: Any,
+    val stride: Int,
+    val features: FeatureCollection,
+)
 
 @Composable
 fun MapEditor(
@@ -263,7 +283,7 @@ fun MapEditor(
 private class MapRenderer {
     private val trackIds = mutableSetOf<String>()
     private val visibleTrackIds = mutableSetOf<String>()
-    private val trackGeometry = mutableMapOf<String, Pair<ch.cld9.velogpx.model.GpxTrack, FeatureCollection>>()
+    private val trackGeometry = mutableMapOf<String, CachedMapGeometry>()
     private var initialCameraApplied = false
     private var lastFocusToken: Long? = null
     private var lastStyle: Style? = null
@@ -283,6 +303,10 @@ private class MapRenderer {
         lastStyle = style
         lastPayload = payload
         visibleTrackIds.clear()
+        val sourcePointCount = payload.document.tracks.sumOf { track -> track.segments.sumOf { it.points.size } } +
+            payload.document.routes.sumOf { it.points.size }
+        val globalRenderStride = ((sourcePointCount + MAX_TOTAL_RENDER_POINTS - 1) /
+            MAX_TOTAL_RENDER_POINTS).coerceAtLeast(1)
         val wanted = payload.document.tracks.map { it.id }.toSet() + payload.document.routes.map { "route-${it.id}" }
         (trackIds - wanted).forEach { id ->
             style.removeLayer(haloLayerId(id))
@@ -293,16 +317,16 @@ private class MapRenderer {
         }
         payload.document.tracks.forEachIndexed { index, track ->
             val cached = trackGeometry[track.id]
-            val geometryChanged = cached?.first !== track
+            val geometryChanged = cached?.model !== track || cached.stride != globalRenderStride
             val collection = if (geometryChanged) {
                 FeatureCollection.fromFeatures(track.segments.mapNotNull { segment ->
                     segment.points.takeIf { it.size >= 2 }?.let { points ->
-                        Feature.fromGeometry(LineString.fromLngLats(renderPoints(points).map { Point.fromLngLat(it.longitude, it.latitude) })).apply {
+                        Feature.fromGeometry(LineString.fromLngLats(renderPoints(points, globalRenderStride).map { Point.fromLngLat(it.longitude, it.latitude) })).apply {
                             addStringProperty("trackId", track.id)
                         }
                     }
-                }).also { trackGeometry[track.id] = track to it }
-            } else cached.second
+                }).also { trackGeometry[track.id] = CachedMapGeometry(track, globalRenderStride, it) }
+            } else requireNotNull(cached).features
             val source = style.getSourceAs<GeoJsonSource>(sourceId(track.id))
             if (source == null) {
                 style.addSource(GeoJsonSource(sourceId(track.id), collection))
@@ -331,11 +355,18 @@ private class MapRenderer {
         }
         payload.document.routes.forEach { route ->
             val key = "route-${route.id}"
-            val feature = route.points.takeIf { it.size >= 2 }?.let { points ->
-                FeatureCollection.fromFeature(Feature.fromGeometry(LineString.fromLngLats(renderPoints(points).map { Point.fromLngLat(it.longitude, it.latitude) })))
-            } ?: FeatureCollection.fromFeatures(emptyList())
+            val cached = trackGeometry[key]
+            val geometryChanged = cached?.model !== route || cached.stride != globalRenderStride
+            val feature = if (geometryChanged) {
+                (route.points.takeIf { it.size >= 2 }?.let { points ->
+                    FeatureCollection.fromFeature(Feature.fromGeometry(LineString.fromLngLats(renderPoints(points, globalRenderStride).map { Point.fromLngLat(it.longitude, it.latitude) })))
+                } ?: FeatureCollection.fromFeatures(emptyList())).also {
+                    trackGeometry[key] = CachedMapGeometry(route, globalRenderStride, it)
+                }
+            } else requireNotNull(cached).features
             val source = style.getSourceAs<GeoJsonSource>(sourceId(key))
-            if (source == null) { style.addSource(GeoJsonSource(sourceId(key), feature)); trackIds += key } else source.setGeoJson(feature)
+            if (source == null) { style.addSource(GeoJsonSource(sourceId(key), feature)); trackIds += key }
+            else if (geometryChanged) source.setGeoJson(feature)
             style.removeLayer(layerId(key))
             style.addLayer(LineLayer(layerId(key), sourceId(key)).withProperties(
                 lineCap(Property.LINE_CAP_ROUND), lineJoin(Property.LINE_JOIN_ROUND), lineColor("#F9A825"), lineWidth(4f), lineOpacity(0.9f),
@@ -365,7 +396,7 @@ private class MapRenderer {
                 ),
             )
         } else {
-            fitPoints(map, documentPoints(document), animate = false, mapView = mapView)
+            fitPoints(map, documentOverviewPoints(document), animate = false, mapView = mapView)
         }
     }
 
@@ -395,7 +426,7 @@ private class MapRenderer {
         ).mapNotNull { it.getStringProperty("trackId") }.toSet()
         return visibleTrackIds.filter { id ->
             if (id !in candidates) return@filter false
-            val track = trackGeometry[id]?.first ?: return@filter false
+            val track = trackGeometry[id]?.model as? ch.cld9.velogpx.model.GpxTrack ?: return@filter false
             track.segments.any { segment ->
                 val line = segment.points.map { point ->
                     val screen = map.projection.toScreenLocation(LatLng(point.latitude, point.longitude))
@@ -597,11 +628,12 @@ private class MapRenderer {
      * Very large imported tracks otherwise allocate one native GeoJSON point per source point and
      * can make opening the project look hung (or exhaust the app heap) before the first frame.
      */
-    private fun renderPoints(points: List<ModelPoint>): List<ModelPoint> {
-        if (points.size <= MAX_RENDER_POINTS_PER_SEGMENT) return points
-        val stride = ((points.lastIndex + MAX_RENDER_POINTS_PER_SEGMENT - 2) /
+    private fun renderPoints(points: List<ModelPoint>, globalStride: Int): List<ModelPoint> {
+        val localStride = ((points.lastIndex + MAX_RENDER_POINTS_PER_SEGMENT - 2) /
             (MAX_RENDER_POINTS_PER_SEGMENT - 1)).coerceAtLeast(1)
-        return buildList(MAX_RENDER_POINTS_PER_SEGMENT) {
+        val stride = maxOf(globalStride, localStride)
+        if (stride == 1) return points
+        return buildList(minOf(points.size, MAX_RENDER_POINTS_PER_SEGMENT)) {
             var index = 0
             while (index < points.lastIndex) {
                 add(points[index])
@@ -613,6 +645,7 @@ private class MapRenderer {
 
     private companion object {
         const val MAX_RENDER_POINTS_PER_SEGMENT = 20_000
+        const val MAX_TOTAL_RENDER_POINTS = 80_000
     }
 }
 

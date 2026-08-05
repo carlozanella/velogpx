@@ -15,12 +15,14 @@ import java.security.DigestInputStream
 import java.security.DigestOutputStream
 import java.security.MessageDigest
 import java.time.Instant
+import java.util.concurrent.CancellationException
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
 class ProjectArchiveCodec(
-    private val parser: GpxParser = GpxParser(),
+    private val maximumGpxBytes: Long = MAX_GPX_BYTES,
+    private val parser: GpxParser = GpxParser(GpxParser.Limits(maxBytes = maximumGpxBytes)),
     private val writer: GpxWriter = GpxWriter(),
 ) {
     fun write(project: ProjectState, output: OutputStream) {
@@ -35,6 +37,9 @@ class ProjectArchiveCodec(
             zip.putNextEntry(archiveEntry(GPX_ENTRY))
             writer.write(project.document, counter, project.document.version)
             counter.flush()
+            if (counter.count > maximumGpxBytes) {
+                throw ProjectFormatException("Project GPX exceeds the ${maximumGpxBytes / (1024 * 1024)} MiB size limit")
+            }
             zip.closeEntry()
 
             val manifest = ProjectJson.encodeManifest(
@@ -60,12 +65,12 @@ class ProjectArchiveCodec(
                 val manifest = readManifest(zip)
                 val descriptor = manifest.getJSONObject("document")
                 val expectedLength = descriptor.getLong("byteLength")
-                require(expectedLength in 0..MAX_GPX_BYTES) { "GPX entry exceeds the project size limit" }
+                require(expectedLength in 0..maximumGpxBytes) { "GPX entry exceeds the project size limit" }
                 val entry = zip.getEntry(GPX_ENTRY) ?: throw ProjectFormatException("Project has no document.gpx entry")
-                if (entry.size >= 0 && entry.size > MAX_GPX_BYTES) throw ProjectFormatException("GPX entry exceeds the project size limit")
+                if (entry.size >= 0 && entry.size > maximumGpxBytes) throw ProjectFormatException("GPX entry exceeds the project size limit")
 
                 val digest = MessageDigest.getInstance("SHA-256")
-                val counted = CountingInputStream(DigestInputStream(zip.getInputStream(entry), digest), MAX_GPX_BYTES)
+                val counted = CountingInputStream(DigestInputStream(zip.getInputStream(entry), digest), maximumGpxBytes)
                 val parsed = counted.use { parser.parse(it, manifest.getString("title")) }
                 val rawDocument = parsed.document ?: throw ProjectFormatException(
                     parsed.issues.firstOrNull()?.message ?: "The archived GPX document is invalid",
@@ -77,6 +82,8 @@ class ProjectArchiveCodec(
                 if (counted.count != expectedLength) throw ProjectFormatException("The project GPX length does not match its manifest")
                 return ProjectJson.decodeState(manifest, restoreIds(rawDocument, descriptor)).sanitizeEditorReferences()
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (error: ProjectFormatException) {
             throw error
         } catch (error: Exception) {
@@ -153,7 +160,7 @@ class ProjectArchiveCodec(
         const val GPX_ENTRY = "document.gpx"
         const val MANIFEST_ENTRY = "manifest.json"
         const val MAX_MANIFEST_BYTES = 1024 * 1024
-        const val MAX_GPX_BYTES = 32L * 1024L * 1024L
+        const val MAX_GPX_BYTES = 256L * 1024L * 1024L
         private val ALLOWED_ENTRIES = setOf(MIMETYPE_ENTRY, GPX_ENTRY, MANIFEST_ENTRY)
     }
 }

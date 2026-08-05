@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.runInterruptible
 import java.io.File
 import java.time.Instant
 import java.util.UUID
@@ -69,7 +70,7 @@ class ProjectRepository private constructor(
         when (selection) {
             is ProjectOpenSelection.Result -> selection.value
             is ProjectOpenSelection.Id -> {
-                val stored = fileStore.read(selection.value)
+                val stored = runInterruptible { fileStore.read(selection.value) }
                 mutex.withLock { openStoredLocked(selection.value, stored) }
             }
         }
@@ -89,7 +90,7 @@ class ProjectRepository private constructor(
         // Reads are safe outside the lock because project writes use atomic replacement. Keeping
         // the expensive archive parse out of the lock also leaves catalog/recovery operations
         // responsive while a large project is being opened.
-        val stored = fileStore.read(projectId)
+        val stored = runInterruptible { fileStore.read(projectId) }
         mutex.withLock { openStoredLocked(projectId, stored) }
     }
 
