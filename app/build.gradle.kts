@@ -13,8 +13,8 @@ android {
         applicationId = "ch.cld9.velogpx"
         minSdk = 26
         targetSdk = 37
-        versionCode = 11
-        versionName = "1.4.2"
+        versionCode = 12
+        versionName = "1.4.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
     }

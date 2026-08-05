@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.3 — 2026-08-06
+
+- Replaced Android's large in-memory XML document with a cancellable streaming GPX parser that releases each XML point node as soon as its model is built, while preserving metadata and extension trees.
+- Collapsed hundreds of per-track MapLibre sources and layers into batched track, selection, and route layers so fragmented projects no longer pay setup and style-update costs per track.
+- Added a synthetic regression shaped like the reported 10.7 MB Italy project: 157 tracks, 183 segments, 122,736 track points, 37 waypoints, dense elevations, long numeric fields, and representative extensions.
+
 ## 1.4.2 — 2026-08-06
 
 - Made project cancellation actually interrupt archive parsing; opening or creating another project can no longer leave hidden parsers consuming CPU and memory.

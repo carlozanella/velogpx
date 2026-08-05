@@ -40,6 +40,7 @@ import org.maplibre.android.style.layers.PropertyFactory.lineColor
 import org.maplibre.android.style.layers.PropertyFactory.lineJoin
 import org.maplibre.android.style.layers.PropertyFactory.lineOpacity
 import org.maplibre.android.style.layers.PropertyFactory.lineWidth
+import org.maplibre.android.style.expressions.Expression
 import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.geojson.Feature
 import org.maplibre.geojson.FeatureCollection
@@ -56,6 +57,13 @@ import kotlin.math.tan
 
 private const val MAP_STYLE = "https://tiles.openfreemap.org/styles/liberty"
 private const val OFFLINE_STYLE = """{"version":8,"name":"Offline editing","sources":{},"layers":[{"id":"offline-background","type":"background","paint":{"background-color":"#edf2ef"}}]}"""
+private const val TRACK_SOURCE = "velogpx-tracks-source"
+private const val TRACK_LAYER = "velogpx-tracks-layer"
+private const val SELECTED_TRACK_SOURCE = "velogpx-selected-tracks-source"
+private const val SELECTED_TRACK_HALO_LAYER = "velogpx-selected-tracks-halo-layer"
+private const val SELECTED_TRACK_LAYER = "velogpx-selected-tracks-layer"
+private const val ROUTE_SOURCE = "velogpx-routes-source"
+private const val ROUTE_LAYER = "velogpx-routes-layer"
 private const val WAYPOINT_SOURCE = "velogpx-waypoints-source"
 private const val WAYPOINT_LAYER = "velogpx-waypoints-layer"
 private const val HANDLE_SOURCE = "velogpx-handles-source"
@@ -127,12 +135,6 @@ private fun documentOverviewPoints(document: GpxDocument): Sequence<ModelPoint> 
 }
 
 private const val MAX_OVERVIEW_FEATURES = 10_000
-
-private data class CachedMapGeometry(
-    val model: Any,
-    val stride: Int,
-    val features: FeatureCollection,
-)
 
 @Composable
 fun MapEditor(
@@ -281,9 +283,8 @@ fun MapEditor(
 }
 
 private class MapRenderer {
-    private val trackIds = mutableSetOf<String>()
     private val visibleTrackIds = mutableSetOf<String>()
-    private val trackGeometry = mutableMapOf<String, CachedMapGeometry>()
+    private var tracksById: Map<String, ch.cld9.velogpx.model.GpxTrack> = emptyMap()
     private var initialCameraApplied = false
     private var lastFocusToken: Long? = null
     private var lastStyle: Style? = null
@@ -293,6 +294,7 @@ private class MapRenderer {
 
     fun sync(map: MapLibreMap, style: Style, payload: MapPayload) {
         val previous = lastPayload
+        val styleChanged = style !== lastStyle
         if (style === lastStyle && previous != null &&
             previous.document === payload.document && previous.styles === payload.styles &&
             previous.selectedTrackIds === payload.selectedTrackIds && previous.selectedPoint === payload.selectedPoint &&
@@ -302,75 +304,23 @@ private class MapRenderer {
         ) return
         lastStyle = style
         lastPayload = payload
+        tracksById = payload.document.tracks.associateBy { it.id }
         visibleTrackIds.clear()
+        payload.document.tracks.forEach { track ->
+            if ((payload.styles[track.id] ?: TrackStyle(0xFF176B45)).visible) visibleTrackIds += track.id
+        }
         val sourcePointCount = payload.document.tracks.sumOf { track -> track.segments.sumOf { it.points.size } } +
             payload.document.routes.sumOf { it.points.size }
         val globalRenderStride = ((sourcePointCount + MAX_TOTAL_RENDER_POINTS - 1) /
             MAX_TOTAL_RENDER_POINTS).coerceAtLeast(1)
-        val wanted = payload.document.tracks.map { it.id }.toSet() + payload.document.routes.map { "route-${it.id}" }
-        (trackIds - wanted).forEach { id ->
-            style.removeLayer(haloLayerId(id))
-            style.removeLayer(layerId(id))
-            style.removeSource(sourceId(id))
-            trackIds.remove(id)
-            trackGeometry.remove(id)
+        val baseChanged = styleChanged || previous == null || previous.document !== payload.document ||
+            previous.styles !== payload.styles
+        if (baseChanged) syncTrackBase(style, payload, globalRenderStride)
+        if (baseChanged || previous.selectedTrackIds !== payload.selectedTrackIds) {
+            syncSelectedTracks(style, payload, globalRenderStride)
         }
-        payload.document.tracks.forEachIndexed { index, track ->
-            val cached = trackGeometry[track.id]
-            val geometryChanged = cached?.model !== track || cached.stride != globalRenderStride
-            val collection = if (geometryChanged) {
-                FeatureCollection.fromFeatures(track.segments.mapNotNull { segment ->
-                    segment.points.takeIf { it.size >= 2 }?.let { points ->
-                        Feature.fromGeometry(LineString.fromLngLats(renderPoints(points, globalRenderStride).map { Point.fromLngLat(it.longitude, it.latitude) })).apply {
-                            addStringProperty("trackId", track.id)
-                        }
-                    }
-                }).also { trackGeometry[track.id] = CachedMapGeometry(track, globalRenderStride, it) }
-            } else requireNotNull(cached).features
-            val source = style.getSourceAs<GeoJsonSource>(sourceId(track.id))
-            if (source == null) {
-                style.addSource(GeoJsonSource(sourceId(track.id), collection))
-                trackIds += track.id
-            } else if (geometryChanged) source.setGeoJson(collection)
-            val trackStyle = payload.styles[track.id] ?: TrackStyle(0xFF176B45)
-            if (trackStyle.visible) visibleTrackIds += track.id
-            style.removeLayer(haloLayerId(track.id))
-            style.removeLayer(layerId(track.id))
-            if (track.id in payload.selectedTrackIds && trackStyle.visible) {
-                style.addLayer(
-                    LineLayer(haloLayerId(track.id), sourceId(track.id)).withProperties(
-                        lineCap(Property.LINE_CAP_ROUND), lineJoin(Property.LINE_JOIN_ROUND),
-                        lineColor("#FFFFFF"), lineWidth(trackStyle.widthDp + 7f), lineOpacity(0.9f),
-                    ),
-                )
-            }
-            style.addLayer(
-                LineLayer(layerId(track.id), sourceId(track.id)).withProperties(
-                    lineCap(Property.LINE_CAP_ROUND), lineJoin(Property.LINE_JOIN_ROUND),
-                    lineColor(colorString(trackStyle.color)),
-                    lineWidth(if (track.id in payload.selectedTrackIds) trackStyle.widthDp + 1f else trackStyle.widthDp),
-                    lineOpacity(if (trackStyle.visible) if (track.id in payload.selectedTrackIds) 1f else 0.72f else 0f),
-                ),
-            )
-        }
-        payload.document.routes.forEach { route ->
-            val key = "route-${route.id}"
-            val cached = trackGeometry[key]
-            val geometryChanged = cached?.model !== route || cached.stride != globalRenderStride
-            val feature = if (geometryChanged) {
-                (route.points.takeIf { it.size >= 2 }?.let { points ->
-                    FeatureCollection.fromFeature(Feature.fromGeometry(LineString.fromLngLats(renderPoints(points, globalRenderStride).map { Point.fromLngLat(it.longitude, it.latitude) })))
-                } ?: FeatureCollection.fromFeatures(emptyList())).also {
-                    trackGeometry[key] = CachedMapGeometry(route, globalRenderStride, it)
-                }
-            } else requireNotNull(cached).features
-            val source = style.getSourceAs<GeoJsonSource>(sourceId(key))
-            if (source == null) { style.addSource(GeoJsonSource(sourceId(key), feature)); trackIds += key }
-            else if (geometryChanged) source.setGeoJson(feature)
-            style.removeLayer(layerId(key))
-            style.addLayer(LineLayer(layerId(key), sourceId(key)).withProperties(
-                lineCap(Property.LINE_CAP_ROUND), lineJoin(Property.LINE_JOIN_ROUND), lineColor("#F9A825"), lineWidth(4f), lineOpacity(0.9f),
-            ))
+        if (styleChanged || previous?.document !== payload.document) {
+            syncRoutes(style, payload.document, globalRenderStride)
         }
         syncWaypoints(style, payload.document.waypoints)
         val selectedTrack = visibleSelectedTrack(payload.document, payload.styles, payload.selectedTrackIds)
@@ -409,8 +359,9 @@ private class MapRenderer {
     fun trackIdsAt(map: MapLibreMap, location: LatLng, corridor: Float): List<String> {
         val point = map.projection.toScreenLocation(location)
         val area = android.graphics.RectF(point.x - corridor, point.y - corridor, point.x + corridor, point.y + corridor)
-        return map.queryRenderedFeatures(area, *visibleTrackIds.map(::layerId).toTypedArray())
+        return map.queryRenderedFeatures(area, TRACK_LAYER, SELECTED_TRACK_LAYER)
             .mapNotNull { feature -> feature.getStringProperty("trackId") }
+            .filter { it in visibleTrackIds }
             .distinct()
     }
 
@@ -422,11 +373,11 @@ private class MapRenderer {
         val bottom = polygon.maxOf { it.y }.toFloat()
         val candidates = map.queryRenderedFeatures(
             android.graphics.RectF(left, top, right, bottom),
-            *visibleTrackIds.map(::layerId).toTypedArray(),
-        ).mapNotNull { it.getStringProperty("trackId") }.toSet()
+            TRACK_LAYER,
+        ).mapNotNull { it.getStringProperty("trackId") }.filter { it in visibleTrackIds }.toSet()
         return visibleTrackIds.filter { id ->
             if (id !in candidates) return@filter false
-            val track = trackGeometry[id]?.model as? ch.cld9.velogpx.model.GpxTrack ?: return@filter false
+            val track = tracksById[id] ?: return@filter false
             track.segments.any { segment ->
                 val line = segment.points.map { point ->
                     val screen = map.projection.toScreenLocation(LatLng(point.latitude, point.longitude))
@@ -435,6 +386,85 @@ private class MapRenderer {
                 LassoGeometry.lineIntersectsPolygon(line, polygon)
             }
         }
+    }
+
+    private fun syncTrackBase(style: Style, payload: MapPayload, stride: Int) {
+        val features = payload.document.tracks.flatMap { track ->
+            val trackStyle = payload.styles[track.id] ?: TrackStyle(0xFF176B45)
+            track.segments.mapNotNull { segment ->
+                segment.points.takeIf { it.size >= 2 }?.let { points ->
+                    trackFeature(track.id, points, stride, trackStyle.color, trackStyle.widthDp, if (trackStyle.visible) 0.72f else 0f)
+                }
+            }
+        }
+        val collection = FeatureCollection.fromFeatures(features)
+        val source = style.getSourceAs<GeoJsonSource>(TRACK_SOURCE)
+        if (source == null) style.addSource(GeoJsonSource(TRACK_SOURCE, collection)) else source.setGeoJson(collection)
+        style.removeLayer(TRACK_LAYER)
+        style.addLayer(LineLayer(TRACK_LAYER, TRACK_SOURCE).withProperties(
+            lineCap(Property.LINE_CAP_ROUND), lineJoin(Property.LINE_JOIN_ROUND),
+            lineColor(Expression.get("color")), lineWidth(Expression.get("width")), lineOpacity(Expression.get("opacity")),
+        ))
+    }
+
+    private fun syncSelectedTracks(style: Style, payload: MapPayload, stride: Int) {
+        val features = payload.document.tracks.asSequence()
+            .filter { it.id in payload.selectedTrackIds }
+            .flatMap { track ->
+                val trackStyle = payload.styles[track.id] ?: TrackStyle(0xFF176B45)
+                if (!trackStyle.visible) emptySequence() else track.segments.asSequence().mapNotNull { segment ->
+                    segment.points.takeIf { it.size >= 2 }?.let { points ->
+                        trackFeature(track.id, points, stride, trackStyle.color, trackStyle.widthDp + 1f, 1f).apply {
+                            addNumberProperty("haloWidth", trackStyle.widthDp + 7f)
+                        }
+                    }
+                }
+            }.toList()
+        val collection = FeatureCollection.fromFeatures(features)
+        val source = style.getSourceAs<GeoJsonSource>(SELECTED_TRACK_SOURCE)
+        if (source == null) style.addSource(GeoJsonSource(SELECTED_TRACK_SOURCE, collection)) else source.setGeoJson(collection)
+        style.removeLayer(SELECTED_TRACK_HALO_LAYER)
+        style.removeLayer(SELECTED_TRACK_LAYER)
+        style.addLayer(LineLayer(SELECTED_TRACK_HALO_LAYER, SELECTED_TRACK_SOURCE).withProperties(
+            lineCap(Property.LINE_CAP_ROUND), lineJoin(Property.LINE_JOIN_ROUND),
+            lineColor("#FFFFFF"), lineWidth(Expression.get("haloWidth")), lineOpacity(0.9f),
+        ))
+        style.addLayer(LineLayer(SELECTED_TRACK_LAYER, SELECTED_TRACK_SOURCE).withProperties(
+            lineCap(Property.LINE_CAP_ROUND), lineJoin(Property.LINE_JOIN_ROUND),
+            lineColor(Expression.get("color")), lineWidth(Expression.get("width")), lineOpacity(1f),
+        ))
+    }
+
+    private fun syncRoutes(style: Style, document: GpxDocument, stride: Int) {
+        val features = document.routes.mapNotNull { route ->
+            route.points.takeIf { it.size >= 2 }?.let { points ->
+                Feature.fromGeometry(LineString.fromLngLats(renderPoints(points, stride).map { Point.fromLngLat(it.longitude, it.latitude) }))
+            }
+        }
+        val collection = FeatureCollection.fromFeatures(features)
+        val source = style.getSourceAs<GeoJsonSource>(ROUTE_SOURCE)
+        if (source == null) style.addSource(GeoJsonSource(ROUTE_SOURCE, collection)) else source.setGeoJson(collection)
+        style.removeLayer(ROUTE_LAYER)
+        style.addLayer(LineLayer(ROUTE_LAYER, ROUTE_SOURCE).withProperties(
+            lineCap(Property.LINE_CAP_ROUND), lineJoin(Property.LINE_JOIN_ROUND),
+            lineColor("#F9A825"), lineWidth(4f), lineOpacity(0.9f),
+        ))
+    }
+
+    private fun trackFeature(
+        trackId: String,
+        points: List<ModelPoint>,
+        stride: Int,
+        color: Long,
+        width: Float,
+        opacity: Float,
+    ) = Feature.fromGeometry(
+        LineString.fromLngLats(renderPoints(points, stride).map { Point.fromLngLat(it.longitude, it.latitude) }),
+    ).apply {
+        addStringProperty("trackId", trackId)
+        addStringProperty("color", colorString(color))
+        addNumberProperty("width", width)
+        addNumberProperty("opacity", opacity)
     }
 
     private fun syncDraft(style: Style, lines: List<MapDraftLine>, anchors: List<ModelPoint>) {

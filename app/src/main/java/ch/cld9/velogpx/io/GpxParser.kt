@@ -21,10 +21,11 @@ import ch.cld9.velogpx.model.XmlContent
 import ch.cld9.velogpx.model.XmlElement
 import ch.cld9.velogpx.model.XmlName
 import ch.cld9.velogpx.model.XmlText
-import org.w3c.dom.CDATASection
-import org.w3c.dom.Comment
-import org.w3c.dom.Element
-import org.w3c.dom.Node
+import org.xml.sax.Attributes
+import org.xml.sax.InputSource
+import org.xml.sax.SAXNotRecognizedException
+import org.xml.sax.SAXNotSupportedException
+import org.xml.sax.ext.DefaultHandler2
 import java.io.FilterInputStream
 import java.io.IOException
 import java.io.InputStream
@@ -33,8 +34,13 @@ import java.time.OffsetDateTime
 import java.util.UUID
 import java.util.concurrent.CancellationException
 import javax.xml.XMLConstants
-import javax.xml.parsers.DocumentBuilderFactory
+import javax.xml.parsers.SAXParserFactory
 
+/**
+ * Streaming GPX parser. Android's DOM implementation becomes disproportionately slow and memory
+ * hungry on large projects. This parser retains only the model plus the currently open XML nodes;
+ * a completed point node is converted and released immediately.
+ */
 class GpxParser(
     private val limits: Limits = Limits(),
 ) {
@@ -46,27 +52,174 @@ class GpxParser(
 
     fun parse(input: InputStream, sourceName: String? = null): GpxParseResult {
         val issues = mutableListOf<GpxIssue>()
-        val ids = ParseIds()
         return try {
-            val factory = DocumentBuilderFactory.newInstance().apply {
+            checkCancelled()
+            val factory = SAXParserFactory.newInstance().apply {
                 isNamespaceAware = true
                 runCatching { isXIncludeAware = false }
-                runCatching { isExpandEntityReferences = false }
                 runCatching { setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true) }
                 runCatching { setFeature("http://apache.org/xml/features/disallow-doctype-decl", true) }
                 runCatching { setFeature("http://xml.org/sax/features/external-general-entities", false) }
                 runCatching { setFeature("http://xml.org/sax/features/external-parameter-entities", false) }
-                runCatching { setAttribute("http://javax.xml.XMLConstants/property/accessExternalDTD", "") }
-                runCatching { setAttribute("http://javax.xml.XMLConstants/property/accessExternalSchema", "") }
+                runCatching { setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false) }
             }
-            val xml = factory.newDocumentBuilder().parse(
-                DoctypeRejectingInputStream(LimitedInputStream(input, limits.maxBytes)),
+            val reader = factory.newSAXParser().xmlReader
+            val handler = StreamingHandler(issues, sourceName)
+            reader.contentHandler = handler
+            reader.errorHandler = handler
+            reader.entityResolver = handler
+            try {
+                reader.setProperty("http://xml.org/sax/properties/lexical-handler", handler)
+            } catch (_: SAXNotRecognizedException) {
+                // Comments and CDATA boundaries are optional preservation details on this parser.
+            } catch (_: SAXNotSupportedException) {
+                // Comments and CDATA boundaries are optional preservation details on this parser.
+            }
+            reader.parse(InputSource(DoctypeRejectingInputStream(LimitedInputStream(input, limits.maxBytes))))
+            GpxParseResult(handler.document ?: error("The document has no root element"), issues)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            GpxParseResult(
+                null,
+                issues + GpxIssue(
+                    IssueSeverity.ERROR,
+                    "INVALID_GPX",
+                    error.message ?: "The GPX document could not be read.",
+                ),
             )
-            val root = xml.documentElement ?: error("The document has no root element")
-            if (root.localNameOrNode() != "gpx") error("Expected a <gpx> root element")
+        }
+    }
 
-            val version = GpxVersion.from(root.attr("version"), root.namespaceURI)
-            val namespace = root.namespaceURI
+    private inner class StreamingHandler(
+        private val issues: MutableList<GpxIssue>,
+        private val sourceName: String?,
+    ) : DefaultHandler2() {
+        private val stack = ArrayDeque<Frame>()
+        private val pendingNamespaces = linkedMapOf<String, String>()
+        private val ids = ParseIds()
+        private val waypoints = mutableListOf<GpxPoint>()
+        private val routes = mutableListOf<GpxRoute>()
+        private val tracks = mutableListOf<GpxTrack>()
+        private var rootNamespace: String? = null
+        private var rootFrame: Frame? = null
+        private var pointCount = 0
+        private var inCData = false
+        var document: GpxDocument? = null
+            private set
+
+        override fun startPrefixMapping(prefix: String?, uri: String?) {
+            pendingNamespaces[prefix.orEmpty()] = uri.orEmpty()
+        }
+
+        override fun startElement(uri: String?, localName: String?, qName: String?, attributes: Attributes) {
+            checkCancelled()
+            if (stack.size > limits.maxExtensionDepth + 8) error("Extension nesting limit exceeded")
+            val qualified = qName.orEmpty()
+            val local = localName?.takeIf { it.isNotEmpty() } ?: qualified.substringAfter(':')
+            val parent = stack.lastOrNull()
+            val namespaceUri = uri?.takeIf { it.isNotEmpty() }
+            val capturePointField = parent?.let { it.isGpx("wpt") || it.isGpx("rtept") || it.isGpx("trkpt") } == true &&
+                local in POINT_TEXT_CHILDREN &&
+                (namespaceUri.isNullOrBlank() || namespaceUri == rootNamespace) &&
+                attributes.length == 0 && pendingNamespaces.isEmpty()
+            val frame = Frame(
+                name = XmlName(namespaceUri, local, qualified.substringBefore(':', "").takeIf { ':' in qualified }),
+                namespaceDeclarations = if (pendingNamespaces.isEmpty()) emptyMap() else LinkedHashMap(pendingNamespaces),
+                attributes = if (attributes.length == 0) emptyList() else buildList(attributes.length) {
+                    for (index in 0 until attributes.length) {
+                        val attributeQName = attributes.getQName(index).orEmpty()
+                        val attributeLocal = attributes.getLocalName(index).takeIf { it.isNotEmpty() }
+                            ?: attributeQName.substringAfter(':')
+                        add(
+                            XmlAttribute(
+                                XmlName(
+                                    attributes.getURI(index).takeIf { it.isNotEmpty() },
+                                    attributeLocal,
+                                    attributeQName.substringBefore(':', "").takeIf { ':' in attributeQName },
+                                ),
+                                attributes.getValue(index),
+                            ),
+                        )
+                    }
+                },
+                captureTextOnly = capturePointField,
+            )
+            pendingNamespaces.clear()
+            if (stack.isEmpty()) {
+                if (local != "gpx") error("Expected a <gpx> root element")
+                rootNamespace = frame.name.namespaceUri
+                rootFrame = frame
+            }
+            stack.addLast(frame)
+        }
+
+        override fun characters(ch: CharArray, start: Int, length: Int) {
+            checkCancelled()
+            if (length == 0 || stack.isEmpty()) return
+            val value = String(ch, start, length)
+            val content: XmlContent = if (inCData) XmlCData(value) else XmlText(value)
+            stack.last().append(content)
+        }
+
+        override fun startCDATA() {
+            inCData = true
+        }
+
+        override fun endCDATA() {
+            inCData = false
+        }
+
+        override fun comment(ch: CharArray, start: Int, length: Int) {
+            if (stack.isNotEmpty()) stack.last().content += XmlComment(String(ch, start, length))
+        }
+
+        override fun endElement(uri: String?, localName: String?, qName: String?) {
+            checkCancelled()
+            val frame = stack.removeLast()
+            val parent = stack.lastOrNull()
+            if (frame.captureTextOnly && parent != null) {
+                parent.fieldTexts[frame.name.localName] = frame.capturedText()
+                return
+            }
+            when {
+                parent == null -> finishRoot(frame)
+                frame.isGpx("wpt") && parent === rootFrame -> {
+                    waypoints += parsePoint(frame, "/gpx/wpt")
+                    countedPoint()
+                }
+                frame.isGpx("rtept") && parent.isGpx("rte") -> {
+                    parent.points += parsePoint(frame, "/gpx/rte/rtept[${parent.points.size}]")
+                    countedPoint()
+                }
+                frame.isGpx("trkpt") && parent.isGpx("trkseg") -> {
+                    val track = stack.elementAtOrNull(stack.size - 2)
+                    val segmentIndex = track?.segments?.size ?: 0
+                    parent.points += parsePoint(frame, "/gpx/trk/trkseg[$segmentIndex]/trkpt[${parent.points.size}]")
+                    countedPoint()
+                }
+                frame.isGpx("trkseg") && parent.isGpx("trk") -> {
+                    parent.segments += GpxTrackSegment(
+                        points = frame.points,
+                        extensions = extensionsAndForeign(frame, SEGMENT_CHILDREN),
+                        id = ids.next("segment"),
+                    )
+                }
+                frame.isGpx("rte") && parent === rootFrame -> routes += parseRoute(frame)
+                frame.isGpx("trk") && parent === rootFrame -> tracks += parseTrack(frame)
+                else -> parent.content += frame.toXml()
+            }
+        }
+
+        private fun countedPoint() {
+            pointCount++
+            if (pointCount > limits.maxPoints) error("Point limit of ${limits.maxPoints} exceeded")
+        }
+
+        private fun finishRoot(root: Frame) {
+            if (pointCount > limits.maxPoints) error("Point limit of ${limits.maxPoints} exceeded")
+            val version = GpxVersion.from(root.attr("version"), root.name.namespaceUri)
+            val namespace = root.name.namespaceUri
             if (namespace.isNullOrBlank()) {
                 issues += GpxIssue(
                     IssueSeverity.WARNING,
@@ -82,241 +235,247 @@ class GpxParser(
                     "/gpx",
                 )
             }
-
-            var metadata: GpxMetadata? = null
-            val waypoints = mutableListOf<GpxPoint>()
-            val routes = mutableListOf<GpxRoute>()
-            val tracks = mutableListOf<GpxTrack>()
-            val rootExtensions = mutableListOf<XmlElement>()
-            var pointCount = 0
-
-            if (version == GpxVersion.V1_0) metadata = parseMetadata10(root, issues)
-            for (child in root.elementChildren()) {
-                checkCancelled()
-                if (!child.isGpxElement()) {
-                    rootExtensions += elementToXml(child, 0)
-                    continue
-                }
-                when (child.localNameOrNode()) {
-                    "metadata" -> metadata = parseMetadata11(child, issues)
-                    "wpt" -> {
-                        waypoints += parsePoint(child, issues, "/gpx/wpt", ids)
-                        pointCount++
-                    }
-                    "rte" -> {
-                        val route = parseRoute(child, issues, ids)
-                        routes += route
-                        pointCount += route.points.size
-                    }
-                    "trk" -> {
-                        val track = parseTrack(child, issues, ids)
-                        tracks += track
-                        pointCount += track.segments.sumOf { it.points.size }
-                    }
-                    "extensions" -> rootExtensions += parseExtensionContainer(child, 0)
-                    "name", "desc", "author", "email", "url", "urlname", "time", "keywords", "bounds" -> Unit
-                    else -> rootExtensions += elementToXml(child, 0)
-                }
-                if (pointCount > limits.maxPoints) error("Point limit of ${limits.maxPoints} exceeded")
+            val metadata = if (version == GpxVersion.V1_0) {
+                parseMetadata10(root)
+            } else {
+                root.child("metadata")?.let(::parseMetadata11)
             }
+            document = GpxDocument(
+                version = version,
+                creator = root.attr("creator") ?: "Unknown",
+                metadata = metadata,
+                waypoints = waypoints,
+                routes = routes,
+                tracks = tracks,
+                rootExtensions = extensionsAndForeign(root, ROOT_CHILDREN),
+                namespaceDeclarations = root.namespaceDeclarations,
+                sourceName = sourceName,
+            )
+        }
 
-            val namespaces = buildMap {
-                for (index in 0 until root.attributes.length) {
-                    val attr = root.attributes.item(index)
-                    when {
-                        attr.nodeName == "xmlns" -> put("", attr.nodeValue)
-                        attr.prefix == "xmlns" -> put(attr.localName, attr.nodeValue)
-                    }
+        private fun Frame.isGpx(localName: String): Boolean =
+            name.localName == localName && (name.namespaceUri.isNullOrBlank() || name.namespaceUri == rootNamespace)
+
+        private fun Frame.gpxChildren(name: String): List<XmlElement> = elements.filter { it.isGpx(name) }
+        private fun Frame.child(name: String): XmlElement? = elements.firstOrNull { it.isGpx(name) }
+        private fun Frame.textOf(name: String): String? = fieldText(name) ?: child(name)?.textContent()
+        private fun Frame.doubleOf(name: String, issues: MutableList<GpxIssue>, path: String): Double? {
+            val text = textOf(name) ?: return null
+            val value = text.toDoubleOrNull()
+            if (value == null || !value.isFinite()) {
+                issues += GpxIssue(
+                    IssueSeverity.WARNING,
+                    "INVALID_NUMBER",
+                    "Invalid $name '$text' was ignored.",
+                    "$path/$name",
+                )
+                return null
+            }
+            return value
+        }
+
+        private fun XmlElement.isGpx(localName: String): Boolean =
+            name.localName == localName && (name.namespaceUri.isNullOrBlank() || name.namespaceUri == rootNamespace)
+
+        private fun XmlElement.child(name: String): XmlElement? =
+            children.asSequence().filterIsInstance<XmlElement>().firstOrNull { it.isGpx(name) }
+
+        private fun XmlElement.children(name: String): List<XmlElement> =
+            children.filterIsInstance<XmlElement>().filter { it.isGpx(name) }
+
+        private fun XmlElement.textOf(name: String): String? = child(name)?.textContent()
+
+        private fun parseMetadata11(element: XmlElement) = GpxMetadata(
+            name = element.textOf("name"),
+            description = element.textOf("desc"),
+            author = element.child("author")?.let(::parsePerson),
+            copyright = element.child("copyright")?.let(::parseCopyright),
+            links = element.children("link").map(::parseLink),
+            timeText = element.textOf("time"),
+            time = parseTime(element.textOf("time"), issues, "/gpx/metadata/time"),
+            keywords = element.textOf("keywords"),
+            bounds = element.child("bounds")?.let { parseBounds(it, issues, "/gpx/metadata/bounds") },
+            extensions = element.child("extensions")?.children?.filterIsInstance<XmlElement>().orEmpty(),
+        )
+
+        private fun parseMetadata10(root: Frame): GpxMetadata? {
+            val name = root.textOf("name")
+            val description = root.textOf("desc")
+            val authorName = root.textOf("author")
+            val email = root.textOf("email")
+            val url = root.textOf("url")
+            val urlName = root.textOf("urlname")
+            val timeText = root.textOf("time")
+            val keywords = root.textOf("keywords")
+            val bounds = root.child("bounds")?.let { parseBounds(it, issues, "/gpx/bounds") }
+            if (listOf(name, description, authorName, email, url, timeText, keywords).all { it == null } && bounds == null) return null
+            val parts = email?.split('@', limit = 2)
+            return GpxMetadata(
+                name = name,
+                description = description,
+                author = if (authorName != null || email != null) {
+                    GpxPerson(
+                        name = authorName,
+                        emailId = parts?.getOrNull(0),
+                        emailDomain = parts?.getOrNull(1),
+                        link = url?.let { GpxLink(it, urlName) },
+                    )
+                } else null,
+                links = url?.let { listOf(GpxLink(it, urlName)) }.orEmpty(),
+                timeText = timeText,
+                time = parseTime(timeText, issues, "/gpx/time"),
+                keywords = keywords,
+                bounds = bounds,
+            )
+        }
+
+        private fun parsePerson(element: XmlElement): GpxPerson {
+            val email = element.child("email")
+            return GpxPerson(
+                name = element.textOf("name"),
+                emailId = email?.attr("id"),
+                emailDomain = email?.attr("domain"),
+                link = element.child("link")?.let(::parseLink),
+            )
+        }
+
+        private fun parseCopyright(element: XmlElement) = GpxCopyright(
+            author = element.attr("author").orEmpty(),
+            year = element.textOf("year")?.toIntOrNull(),
+            license = element.textOf("license"),
+        )
+
+        private fun parseLink(element: XmlElement) = GpxLink(
+            href = element.attr("href") ?: element.textContent().trim(),
+            text = element.textOf("text"),
+            type = element.textOf("type"),
+        )
+
+        private fun parseRoute(frame: Frame) = GpxRoute(
+            name = frame.textOf("name"),
+            comment = frame.textOf("cmt"),
+            description = frame.textOf("desc"),
+            source = frame.textOf("src"),
+            links = linksFrom(frame),
+            number = frame.textOf("number")?.toIntOrNull(),
+            type = frame.textOf("type"),
+            points = frame.points,
+            extensions = extensionsAndForeign(frame, ROUTE_CHILDREN),
+            id = ids.next("route"),
+        )
+
+        private fun parseTrack(frame: Frame) = GpxTrack(
+            name = frame.textOf("name"),
+            comment = frame.textOf("cmt"),
+            description = frame.textOf("desc"),
+            source = frame.textOf("src"),
+            links = linksFrom(frame),
+            number = frame.textOf("number")?.toIntOrNull(),
+            type = frame.textOf("type"),
+            segments = frame.segments,
+            extensions = extensionsAndForeign(frame, TRACK_CHILDREN),
+            id = ids.next("track"),
+        )
+
+        private fun parsePoint(frame: Frame, path: String): GpxPoint {
+            val latitude = parseCoordinate(frame.attr("lat"), -90.0, 90.0, "latitude", issues, path)
+            val longitude = parseCoordinate(frame.attr("lon"), -180.0, 180.0, "longitude", issues, path)
+            val timeText = frame.textOf("time")
+            return GpxPoint(
+                latitude = latitude,
+                longitude = longitude,
+                elevation = frame.doubleOf("ele", issues, path),
+                timeText = timeText,
+                time = parseTime(timeText, issues, "$path/time"),
+                magneticVariation = frame.doubleOf("magvar", issues, path),
+                geoidHeight = frame.doubleOf("geoidheight", issues, path),
+                name = frame.textOf("name"),
+                comment = frame.textOf("cmt"),
+                description = frame.textOf("desc"),
+                source = frame.textOf("src"),
+                links = linksFrom(frame),
+                symbol = frame.textOf("sym"),
+                type = frame.textOf("type"),
+                fix = frame.textOf("fix"),
+                satellites = frame.textOf("sat")?.toIntOrNull(),
+                hdop = frame.doubleOf("hdop", issues, path),
+                vdop = frame.doubleOf("vdop", issues, path),
+                pdop = frame.doubleOf("pdop", issues, path),
+                ageOfDgpsData = frame.doubleOf("ageofdgpsdata", issues, path),
+                dgpsId = frame.textOf("dgpsid")?.toIntOrNull(),
+                course = frame.doubleOf("course", issues, path),
+                speed = frame.doubleOf("speed", issues, path),
+                extensions = extensionsAndForeign(frame, POINT_CHILDREN),
+                id = ids.next("point"),
+            )
+        }
+
+        private fun linksFrom(frame: Frame): List<GpxLink> {
+            val modern = frame.gpxChildren("link").map(::parseLink)
+            if (modern.isNotEmpty()) return modern
+            return frame.textOf("url")?.let { listOf(GpxLink(it, frame.textOf("urlname"))) }.orEmpty()
+        }
+
+        private fun extensionsAndForeign(frame: Frame, standardNames: Set<String>): List<XmlElement> = buildList {
+            for (child in frame.elements) {
+                when {
+                    child.isGpx("extensions") -> addAll(child.children.filterIsInstance<XmlElement>())
+                    child.name.namespaceUri != rootNamespace && !child.name.namespaceUri.isNullOrBlank() -> add(child)
+                    child.name.localName !in standardNames -> add(child)
                 }
             }
-            GpxParseResult(
-                GpxDocument(
-                    version = version,
-                    creator = root.attr("creator") ?: "Unknown",
-                    metadata = metadata,
-                    waypoints = waypoints,
-                    routes = routes,
-                    tracks = tracks,
-                    rootExtensions = rootExtensions,
-                    namespaceDeclarations = namespaces,
-                    sourceName = sourceName,
-                ),
-                issues,
-            )
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (error: Exception) {
-            GpxParseResult(
-                null,
-                issues + GpxIssue(
-                    IssueSeverity.ERROR,
-                    "INVALID_GPX",
-                    error.message ?: "The GPX document could not be read.",
-                ),
-            )
         }
     }
 
-    private fun parseMetadata11(element: Element, issues: MutableList<GpxIssue>) = GpxMetadata(
-        name = element.textOf("name"),
-        description = element.textOf("desc"),
-        author = element.child("author")?.let(::parsePerson),
-        copyright = element.child("copyright")?.let(::parseCopyright),
-        links = element.children("link").map(::parseLink),
-        timeText = element.textOf("time"),
-        time = parseTime(element.textOf("time"), issues, "/gpx/metadata/time"),
-        keywords = element.textOf("keywords"),
-        bounds = element.child("bounds")?.let { parseBounds(it, issues, "/gpx/metadata/bounds") },
-        extensions = element.child("extensions")?.let { parseExtensionContainer(it, 0) }.orEmpty(),
-    )
+    private class Frame(
+        val name: XmlName,
+        val namespaceDeclarations: Map<String, String>,
+        val attributes: List<XmlAttribute>,
+        val captureTextOnly: Boolean,
+    ) {
+        private var mutableContent: MutableList<XmlContent>? = null
+        val content: MutableList<XmlContent> get() = mutableContent ?: mutableListOf<XmlContent>().also { mutableContent = it }
+        private var textBuilder: StringBuilder? = null
+        private var mutableFieldTexts: MutableMap<String, String>? = null
+        val fieldTexts: MutableMap<String, String>
+            get() = mutableFieldTexts ?: mutableMapOf<String, String>().also { mutableFieldTexts = it }
+        fun fieldText(name: String): String? = mutableFieldTexts?.get(name)
+        fun capturedText(): String = textBuilder?.toString().orEmpty()
+        private var mutablePoints: MutableList<GpxPoint>? = null
+        val points: MutableList<GpxPoint>
+            get() = mutablePoints ?: mutableListOf<GpxPoint>().also { mutablePoints = it }
+        private var mutableSegments: MutableList<GpxTrackSegment>? = null
+        val segments: MutableList<GpxTrackSegment>
+            get() = mutableSegments ?: mutableListOf<GpxTrackSegment>().also { mutableSegments = it }
+        private var cachedElements: List<XmlElement>? = null
+        // Frames are queried only after their closing tag. Cache this view because a point has many
+        // optional GPX fields and repeatedly filtering its content dominated Android parse time.
+        val elements: List<XmlElement>
+            get() = cachedElements ?: mutableContent.orEmpty().filterIsInstance<XmlElement>().also { cachedElements = it }
 
-    private fun parseMetadata10(root: Element, issues: MutableList<GpxIssue>): GpxMetadata? {
-        val name = root.textOf("name")
-        val description = root.textOf("desc")
-        val authorName = root.textOf("author")
-        val email = root.textOf("email")
-        val url = root.textOf("url")
-        val urlName = root.textOf("urlname")
-        val timeText = root.textOf("time")
-        val keywords = root.textOf("keywords")
-        val bounds = root.child("bounds")?.let { parseBounds(it, issues, "/gpx/bounds") }
-        if (listOf(name, description, authorName, email, url, timeText, keywords).all { it == null } && bounds == null) return null
-        return GpxMetadata(
-            name = name,
-            description = description,
-            author = if (authorName != null || email != null) {
-                val parts = email?.split('@', limit = 2)
-                GpxPerson(
-                    name = authorName,
-                    emailId = parts?.getOrNull(0),
-                    emailDomain = parts?.getOrNull(1),
-                    link = url?.let { GpxLink(it, urlName) },
-                )
-            } else null,
-            links = url?.let { listOf(GpxLink(it, urlName)) }.orEmpty(),
-            timeText = timeText,
-            time = parseTime(timeText, issues, "/gpx/time"),
-            keywords = keywords,
-            bounds = bounds,
-        )
+        fun attr(name: String): String? = attributes.firstOrNull { it.name.namespaceUri.isNullOrBlank() && it.name.localName == name }?.value
+        fun toXml() = XmlElement(name, namespaceDeclarations, attributes, mutableContent.orEmpty())
+
+        fun append(value: XmlContent) {
+            if (captureTextOnly) {
+                when (value) {
+                    is XmlText -> (textBuilder ?: StringBuilder().also { textBuilder = it }).append(value.value)
+                    is XmlCData -> (textBuilder ?: StringBuilder().also { textBuilder = it }).append(value.value)
+                    else -> Unit
+                }
+                return
+            }
+            val content = content
+            val previous = content.lastOrNull()
+            when {
+                previous is XmlText && value is XmlText -> content[content.lastIndex] = XmlText(previous.value + value.value)
+                previous is XmlCData && value is XmlCData -> content[content.lastIndex] = XmlCData(previous.value + value.value)
+                else -> content += value
+            }
+        }
     }
 
-    private fun parsePerson(element: Element): GpxPerson {
-        val email = element.child("email")
-        return GpxPerson(
-            name = element.textOf("name"),
-            emailId = email?.attr("id"),
-            emailDomain = email?.attr("domain"),
-            link = element.child("link")?.let(::parseLink),
-        )
-    }
-
-    private fun parseCopyright(element: Element) = GpxCopyright(
-        author = element.attr("author").orEmpty(),
-        year = element.textOf("year")?.toIntOrNull(),
-        license = element.textOf("license"),
-    )
-
-    private fun parseLink(element: Element) = GpxLink(
-        href = element.attr("href") ?: element.textContent.orEmpty().trim(),
-        text = element.textOf("text"),
-        type = element.textOf("type"),
-    )
-
-    private fun parseRoute(element: Element, issues: MutableList<GpxIssue>, ids: ParseIds): GpxRoute {
-        val fields = ElementFields(element)
-        return GpxRoute(
-            name = fields.textOf("name"),
-            comment = fields.textOf("cmt"),
-            description = fields.textOf("desc"),
-            source = fields.textOf("src"),
-            links = linksFrom(fields),
-            number = fields.textOf("number")?.toIntOrNull(),
-            type = fields.textOf("type"),
-            points = fields.children("rtept").mapIndexed { index, point ->
-                checkCancelled()
-                parsePoint(point, issues, "/gpx/rte/rtept[$index]", ids)
-            },
-            extensions = extensionsAndForeign(element, ROUTE_CHILDREN, fields.elements),
-            id = ids.next("route"),
-        )
-    }
-
-    private fun parseTrack(element: Element, issues: MutableList<GpxIssue>, ids: ParseIds): GpxTrack {
-        val fields = ElementFields(element)
-        return GpxTrack(
-            name = fields.textOf("name"),
-            comment = fields.textOf("cmt"),
-            description = fields.textOf("desc"),
-            source = fields.textOf("src"),
-            links = linksFrom(fields),
-            number = fields.textOf("number")?.toIntOrNull(),
-            type = fields.textOf("type"),
-            segments = fields.children("trkseg").mapIndexed { segmentIndex, segment ->
-                checkCancelled()
-                val segmentFields = ElementFields(segment)
-                GpxTrackSegment(
-                    points = segmentFields.children("trkpt").mapIndexed { pointIndex, point ->
-                        checkCancelled()
-                        parsePoint(point, issues, "/gpx/trk/trkseg[$segmentIndex]/trkpt[$pointIndex]", ids)
-                    },
-                    extensions = extensionsAndForeign(segment, SEGMENT_CHILDREN, segmentFields.elements),
-                    id = ids.next("segment"),
-                )
-            },
-            extensions = extensionsAndForeign(element, TRACK_CHILDREN, fields.elements),
-            id = ids.next("track"),
-        )
-    }
-
-    private fun parsePoint(element: Element, issues: MutableList<GpxIssue>, path: String, ids: ParseIds): GpxPoint {
-        checkCancelled()
-        val fields = ElementFields(element)
-        val latitude = parseCoordinate(element.attr("lat"), -90.0, 90.0, "latitude", issues, path)
-        val longitude = parseCoordinate(element.attr("lon"), -180.0, 180.0, "longitude", issues, path)
-        val timeText = fields.textOf("time")
-        return GpxPoint(
-            latitude = latitude,
-            longitude = longitude,
-            elevation = fields.doubleOf("ele", issues, path),
-            timeText = timeText,
-            time = parseTime(timeText, issues, "$path/time"),
-            magneticVariation = fields.doubleOf("magvar", issues, path),
-            geoidHeight = fields.doubleOf("geoidheight", issues, path),
-            name = fields.textOf("name"),
-            comment = fields.textOf("cmt"),
-            description = fields.textOf("desc"),
-            source = fields.textOf("src"),
-            links = linksFrom(fields),
-            symbol = fields.textOf("sym"),
-            type = fields.textOf("type"),
-            fix = fields.textOf("fix"),
-            satellites = fields.textOf("sat")?.toIntOrNull(),
-            hdop = fields.doubleOf("hdop", issues, path),
-            vdop = fields.doubleOf("vdop", issues, path),
-            pdop = fields.doubleOf("pdop", issues, path),
-            ageOfDgpsData = fields.doubleOf("ageofdgpsdata", issues, path),
-            dgpsId = fields.textOf("dgpsid")?.toIntOrNull(),
-            course = fields.doubleOf("course", issues, path),
-            speed = fields.doubleOf("speed", issues, path),
-            extensions = extensionsAndForeign(element, POINT_CHILDREN, fields.elements),
-            id = ids.next("point"),
-        )
-    }
-
-    private fun linksFrom(element: Element): List<GpxLink> {
-        val modern = element.children("link").map(::parseLink)
-        if (modern.isNotEmpty()) return modern
-        return element.textOf("url")?.let { listOf(GpxLink(it, element.textOf("urlname"))) }.orEmpty()
-    }
-
-    private fun linksFrom(fields: ElementFields): List<GpxLink> {
-        val modern = fields.children("link").map(::parseLink)
-        if (modern.isNotEmpty()) return modern
-        return fields.textOf("url")?.let { listOf(GpxLink(it, fields.textOf("urlname"))) }.orEmpty()
-    }
-
-    private fun parseBounds(element: Element, issues: MutableList<GpxIssue>, path: String): GpxBounds? = try {
+    private fun parseBounds(element: XmlElement, issues: MutableList<GpxIssue>, path: String): GpxBounds? = try {
         GpxBounds(
             minLatitude = element.attr("minlat")!!.toDouble(),
             minLongitude = element.attr("minlon")!!.toDouble(),
@@ -354,56 +513,6 @@ class GpxParser(
             }
     }
 
-    private fun extensionsAndForeign(
-        element: Element,
-        standardNames: Set<String>,
-        children: List<Element> = element.elementChildren(),
-    ): List<XmlElement> = buildList {
-        for (child in children) {
-            when {
-                child.isGpxElement() && child.localNameOrNode() == "extensions" -> addAll(parseExtensionContainer(child, 0))
-                !child.isGpxElement() || child.localNameOrNode() !in standardNames -> add(elementToXml(child, 0))
-            }
-        }
-    }
-
-    private fun parseExtensionContainer(element: Element, depth: Int) =
-        element.elementChildren().map { elementToXml(it, depth + 1) }
-
-    private fun elementToXml(element: Element, depth: Int): XmlElement {
-        if (depth > limits.maxExtensionDepth) error("Extension nesting limit exceeded")
-        val declarations = linkedMapOf<String, String>()
-        val attributes = mutableListOf<XmlAttribute>()
-        for (index in 0 until element.attributes.length) {
-            val attr = element.attributes.item(index)
-            when {
-                attr.nodeName == "xmlns" -> declarations[""] = attr.nodeValue
-                attr.prefix == "xmlns" -> declarations[attr.localName] = attr.nodeValue
-                else -> attributes += XmlAttribute(
-                    XmlName(attr.namespaceURI, attr.localName ?: attr.nodeName, attr.prefix),
-                    attr.nodeValue,
-                )
-            }
-        }
-        val children = mutableListOf<XmlContent>()
-        for (index in 0 until element.childNodes.length) {
-            when (val node = element.childNodes.item(index)) {
-                is Element -> children += elementToXml(node, depth + 1)
-                is CDATASection -> children += XmlCData(node.data)
-                is Comment -> children += XmlComment(node.data)
-                else -> if (node.nodeType == Node.TEXT_NODE && node.nodeValue.isNotEmpty()) {
-                    children += XmlText(node.nodeValue)
-                }
-            }
-        }
-        return XmlElement(
-            name = XmlName(element.namespaceURI, element.localNameOrNode(), element.prefix),
-            namespaceDeclarations = declarations,
-            attributes = attributes,
-            children = children,
-        )
-    }
-
     private class LimitedInputStream(input: InputStream, private val maximum: Long) : FilterInputStream(input) {
         private var count = 0L
         override fun read(): Int {
@@ -425,7 +534,6 @@ class GpxParser(
         private var matched = 0
 
         override fun read(): Int = super.read().also { if (it >= 0) inspect(it.toByte()) }
-
         override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
             super.read(buffer, offset, length).also { count ->
                 if (count > 0) for (index in offset until offset + count) inspect(buffer[index])
@@ -443,6 +551,10 @@ class GpxParser(
     }
 
     companion object {
+        private val ROOT_CHILDREN = setOf(
+            "metadata", "wpt", "rte", "trk", "extensions",
+            "name", "desc", "author", "email", "url", "urlname", "time", "keywords", "bounds",
+        )
         private val ROUTE_CHILDREN = setOf("name", "cmt", "desc", "src", "link", "url", "urlname", "number", "type", "extensions", "rtept")
         private val TRACK_CHILDREN = setOf("name", "cmt", "desc", "src", "link", "url", "urlname", "number", "type", "extensions", "trkseg")
         private val SEGMENT_CHILDREN = setOf("trkpt", "extensions")
@@ -450,6 +562,7 @@ class GpxParser(
             "ele", "time", "magvar", "geoidheight", "name", "cmt", "desc", "src", "link", "url", "urlname",
             "sym", "type", "fix", "sat", "hdop", "vdop", "pdop", "ageofdgpsdata", "dgpsid", "course", "speed", "extensions",
         )
+        private val POINT_TEXT_CHILDREN = POINT_CHILDREN - setOf("link", "extensions")
     }
 
     private class ParseIds {
@@ -459,43 +572,21 @@ class GpxParser(
     }
 }
 
-private class ElementFields(element: Element) {
-    val elements: List<Element> = element.elementChildren()
-    fun children(name: String): List<Element> = elements.filter { it.isGpxElement() && it.localNameOrNode() == name }
-    fun textOf(name: String): String? = elements.firstOrNull { it.isGpxElement() && it.localNameOrNode() == name }?.textContent
-    fun doubleOf(name: String, issues: MutableList<GpxIssue>, path: String): Double? {
-        val text = textOf(name) ?: return null
-        val value = text.toDoubleOrNull()
-        if (value == null || !value.isFinite()) {
-            issues += GpxIssue(IssueSeverity.WARNING, "INVALID_NUMBER", "Invalid $name '$text' was ignored.", "$path/$name")
-            return null
+private fun XmlElement.attr(name: String): String? =
+    attributes.firstOrNull { it.name.namespaceUri.isNullOrBlank() && it.name.localName == name }?.value
+
+private fun XmlElement.textContent(): String = buildString {
+    fun appendContent(content: XmlContent) {
+        when (content) {
+            is XmlText -> append(content.value)
+            is XmlCData -> append(content.value)
+            is XmlElement -> content.children.forEach(::appendContent)
+            is XmlComment -> Unit
         }
-        return value
     }
+    children.forEach(::appendContent)
 }
 
 private fun checkCancelled() {
     if (Thread.currentThread().isInterrupted) throw CancellationException("GPX parsing cancelled")
-}
-
-private fun Element.localNameOrNode(): String = localName ?: nodeName.substringAfter(':')
-private fun Element.attr(name: String): String? = getAttribute(name).takeIf { hasAttribute(name) }
-private fun Element.elementChildren(): List<Element> = buildList {
-    for (index in 0 until childNodes.length) (childNodes.item(index) as? Element)?.let(::add)
-}
-private fun Element.isGpxElement(): Boolean {
-    val rootNamespace = ownerDocument?.documentElement?.namespaceURI
-    return namespaceURI.isNullOrBlank() || namespaceURI == rootNamespace
-}
-private fun Element.children(name: String): List<Element> = elementChildren().filter { it.isGpxElement() && it.localNameOrNode() == name }
-private fun Element.child(name: String): Element? = elementChildren().firstOrNull { it.isGpxElement() && it.localNameOrNode() == name }
-private fun Element.textOf(name: String): String? = child(name)?.textContent
-private fun Element.doubleOf(name: String, issues: MutableList<GpxIssue>, path: String): Double? {
-    val text = textOf(name) ?: return null
-    val value = text.toDoubleOrNull()
-    if (value == null || !value.isFinite()) {
-        issues += GpxIssue(IssueSeverity.WARNING, "INVALID_NUMBER", "Invalid $name '$text' was ignored.", "$path/$name")
-        return null
-    }
-    return value
 }

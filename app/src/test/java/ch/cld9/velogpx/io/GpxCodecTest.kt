@@ -157,22 +157,39 @@ class GpxCodecTest {
         }
     }
 
-    @Test fun denseProjectParsesWithoutPerPointIdentityBottleneck() {
-        val source = buildString(4_000_000) {
-            append("<gpx xmlns=\"http://www.topografix.com/GPX/1/1\" version=\"1.1\" creator=\"test\"><trk><trkseg>")
-            repeat(50_000) { index ->
-                append("<trkpt lat=\"47.0\" lon=\"")
-                append(8.0 + index / 1_000_000.0)
-                append("\"><ele>500</ele></trkpt>")
+    @Test fun productionShapedLargeProjectParsesWithCorrectHierarchyAndUniqueIds() {
+        var pointIndex = 0
+        val source = buildString(11_000_000) {
+            append("<gpx xmlns=\"http://www.topografix.com/GPX/1/1\" version=\"1.1\" creator=\"test\">")
+            repeat(37) { index -> append("<wpt lat=\"45.1\" lon=\"8.2\"><name>Waypoint $index</name></wpt>") }
+            val basePerSegment = 122_736 / 183
+            var remainder = 122_736 % 183
+            repeat(157) { trackIndex ->
+                append("<trk><name>Italy-shaped track $trackIndex</name>")
+                if (trackIndex < 13) append("<extensions><x:data xmlns:x=\"urn:synthetic\">value</x:data></extensions>")
+                repeat(if (trackIndex < 26) 2 else 1) {
+                    val segmentPoints = basePerSegment + if (remainder-- > 0) 1 else 0
+                    append("<trkseg>")
+                    repeat(segmentPoints) {
+                        append("<trkpt lat=\"45.123456789012\" lon=\"8.1234567890123\"")
+                        if (pointIndex < 116_451) append("><ele>123.1234567890</ele></trkpt>") else append("/>")
+                        pointIndex++
+                    }
+                    append("</trkseg>")
+                }
+                append("</trk>")
             }
-            append("</trkseg></trk></gpx>")
+            append("</gpx>")
         }
 
         val document = GpxParser().parse(ByteArrayInputStream(source.toByteArray())).document!!
 
-        assertEquals(50_000, document.pointCount)
-        val points = document.tracks.single().segments.single().points
-        assertEquals(points.size, points.map { it.id }.toSet().size)
+        assertEquals(157, document.tracks.size)
+        assertEquals(183, document.tracks.sumOf { it.segments.size })
+        assertEquals(122_773, document.pointCount)
+        assertEquals(13, document.tracks.count { it.extensions.isNotEmpty() })
+        val pointIds = document.tracks.asSequence().flatMap { it.segments.asSequence() }.flatMap { it.points.asSequence() }.map { it.id }.toSet()
+        assertEquals(122_736, pointIds.size)
     }
 
     @Test fun invalidCoordinatesAreRejected() {
