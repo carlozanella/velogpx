@@ -37,9 +37,11 @@ Every geometry edit creates a new immutable document revision, adds the prior re
 
 Unknown extension nodes retain namespace URI, local name, prefix hint, ordered attributes, namespace declarations, and ordered text/CDATA/comment/element children. This is semantic XML preservation rather than byte-for-byte whitespace preservation.
 
+GPX input is parsed as a cancellable SAX stream. Completed coordinate nodes are converted directly into immutable model points and then released, avoiding Android DOM's time and memory growth on six-figure-point projects while retaining namespace-aware metadata and extension subtrees.
+
 ## Map and network policy
 
-MapLibre renders per-track GeoJSON sources; only cached sampled edit handles are displayed for large tracks while full geometry remains in the model/export. Elevation drawing is peak-preserving and bounded to 3,000 chart samples, while cursor calculations retain full precision. OpenFreeMap avoids an SDK key and explicitly supports public use. VeloGPX never bulk-downloads the OpenStreetMap standard tile service.
+MapLibre renders tracks through shared base and selected-track GeoJSON sources/layers, with a separate batched route layer. Feature properties retain per-track identity, color, width, opacity, picking, and lasso behavior without creating sources and layers in proportion to the track count. Only sampled edit handles are displayed for large tracks, and total rendered line geometry is bounded while full geometry remains in the model/export. Elevation drawing is peak-preserving and bounded to 3,000 chart samples, while cursor calculations retain full precision. OpenFreeMap avoids an SDK key and explicitly supports public use. VeloGPX never bulk-downloads the OpenStreetMap standard tile service.
 
 Terrain elevation enrichment is an explicit, transactional transform. It selects anchors only inside missing-elevation runs, at roughly twice the source DEM resolution, and batches at the provider's 100-coordinate limit. The provider response is validated completely before any model change; recorded elevations are never overwritten, intermediate points are distance-interpolated between terrain/recorded anchors, stale results are discarded, and the final track replacement is one undoable edit. Attribution: Copernicus DEM GLO-90, delivered by Open-Meteo.
 

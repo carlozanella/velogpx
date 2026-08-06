@@ -6,6 +6,7 @@ The host test suite covers:
 - Segment-gap-safe analysis, exact split invariants, reverse-twice identity, chronological reverse, protected simplification, and time generation.
 - Daily-stage exact coverage and boundary continuity.
 - GPX 1.1 hierarchy/Unicode/extension round trips and GPX 1.0 metadata/course/speed/direct-extension round trips.
+- Streaming-parser cancellation, size/point limits, and a production-shaped 10.7 MB regression with 157 tracks, 183 segments, 122,736 track points, 37 waypoints, 116,451 elevations, long numeric fields, and representative extensions.
 - Invalid coordinates and external-entity rejection.
 - Atomic project archive round trips, catalog CRUD, multi-selection/editor-state persistence, autosave timing, snapshots, corruption recovery, and legacy migration.
 - Exact/heuristic join ordering, orientations and constraints, gap policies, descendant-ID uniqueness, and distance/segment preservation.
@@ -16,7 +17,7 @@ The host test suite covers:
 - Exact import geometry identity, repeated-batch suppression, direction and segment-boundary distinction, and persisted layer-scroll state.
 - Combined-selection profiles, merge-order/orientation mapping, excluded endpoint gaps, and freehand-lasso containment/intersection geometry.
 
-The v1.2.3 release gate runs 88 host tests and 12 Android-runtime tests. Host coverage includes exact Tracks-list row indexing, collapsed-group reveal behavior, and one-shot panel-entry focus requests. Runtime coverage verifies that a deep selected-track row is actually scrolled into the visible Compose viewport, plus the freehand lasso gesture overlay, Android XML security, readable GPX 1.1 single-course materialization without multi-segment point loss, URI grants, send and open-file chooser fallbacks, and Garmin Connect `ACTION_VIEW` targeting.
+The v1.4.3 release gate runs 105 host tests and 12 Android-runtime tests. Host coverage includes the production-shaped large-project regression, exact Tracks-list row indexing, collapsed-group reveal behavior, and one-shot panel-entry focus requests. Runtime coverage verifies that a deep selected-track row is actually scrolled into the visible Compose viewport, plus the freehand lasso gesture overlay, Android XML security, readable GPX 1.1 single-course materialization without multi-segment point loss, URI grants, send and open-file chooser fallbacks, and Garmin Connect `ACTION_VIEW` targeting.
 
 Run all automated checks with:
 
@@ -38,4 +39,4 @@ The emulator smoke procedure uses an Android 17/API 37.1 16-KB-page x86_64 image
 10. Select one or several tracks, tap empty map space, and verify the highlight/profile/cursor clear while Multi mode remains active when applicable.
 11. Select a track on the map, open Tracks, and verify its row is revealed and scrolled into view; long-press a Tracks row to enter Multi, lasso several visible tracks, and verify the combined profile/total follows the same order and directions as Merge.
 
-The v1.2.3 release gate covers 100 tests, Android lint, debug/release APK assembly, API 37 installation/version verification, selected-track reveal in Tracks, selection persistence, import grouping, interactive profile/point detail, lasso and long-press multi-select, merge preview, and Garmin single-course/open-file validation. This repository's GitHub Actions workflow repeats unit tests, lint, and APK assembly on each push.
+The v1.4.3 release gate covers 117 tests, Android lint, release APK assembly, and all API 37 runtime checks. The reported 10,703,054-byte Italy project was also tested locally without committing it: 157 tracks, 183 segments, and 122,773 total points opened in about three seconds on the reporting device. A synthetic fixture reproduces the relevant hierarchy, field density, precision, and size so future parser regressions do not depend on the external project file. This repository's GitHub Actions workflow repeats unit tests, lint, and APK assembly on each push.
